@@ -3087,7 +3087,7 @@ TEST_CASE("Native capture extension owns the exact three-entry indirect branch t
         REQUIRE_FALSE(Shader::Ampere::ValidateCaptureIndirectBranchTargets(invalid, 0x80, 27));
     }
 
-    // Pokopia: a case laid out before the first entry.
+    // A case laid out before the first entry.
     constexpr std::array<u32, 3> unordered_targets{0x5040, 0x4dc0, 0x50c0};
     const auto unordered =
         Shader::Ampere::ValidateCaptureIndirectBranchTargets(unordered_targets, 0x80, 1277);

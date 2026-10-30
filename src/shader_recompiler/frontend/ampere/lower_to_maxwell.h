@@ -1960,7 +1960,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             // Source size (bits 84-85), signedness (74) and rounding (78-79) use the same value
             // order as the Maxwell I2F fields; only the F32 destination (75-76 == 2) is accepted.
             // Bits 60-61 select the source byte of an 8-bit source (Rb.B1-B3, e.g. RGBA8 unpacks
-            // in Pokopia), Maxwell's selector at 41-42.
+            // in Switch 2 titles), Maxwell's selector at 41-42.
             const u32 selector = insn.Bits(60, 2);
             if ((insn.words[2] & ~0x0030c400U) != 0x1000 || (insn.words[1] & 0xcfffff00U) ||
                 insn.Bits(84, 2) == 3 || (selector != 0 && insn.Bits(84, 2) != 0))
@@ -2436,7 +2436,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             }
             // General loop exit: a predicated NOINC call over the next instruction, an
             // unconditional backward BRA. NOINC saves no return address, so this is a
-            // conditional forward branch (Pokopia compute shaders, any guard predicate).
+            // conditional forward branch (Switch 2 compute shaders, any guard predicate).
             if (native_predicate != 7 && insn.words[1] == 16 && insn.words[2] == 0x03c00000 &&
                 index + 2 < code.size() && code[index + 1].Bits(0, 12) == 0x947 &&
                 code[index + 1].Bits(12, 4) == 7 && code[index + 1].Bits(87, 4) == 7) {

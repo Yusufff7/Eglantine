@@ -165,7 +165,7 @@ void BSD_USA::StartMonitoring(HLERequestContext& ctx) {
     rb.Push(ResultSuccess);
 }
 
-// Pokopia calls this at boot and hangs when it gets no reply.
+// Some Switch 2 titles call this at boot and hang when they get no reply.
 void BSD_USA::Unknown36(HLERequestContext& ctx) {
     LOG_WARNING(Service, "(STUBBED) called");
 

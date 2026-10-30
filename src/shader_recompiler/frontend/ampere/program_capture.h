@@ -74,7 +74,7 @@ inline std::optional<CaptureIndirectBranchTable> TrackCaptureIndirectBranchTable
     return result;
 }
 
-// Table entries need not be ascending: Pokopia has cases laid out before the first one
+// Table entries need not be ascending: some titles have cases laid out before the first one
 // ([0x5040, 0x4dc0, 0x50c0]). Every target but the furthest must already be captured.
 inline std::optional<std::array<u32, 3>> ValidateCaptureIndirectBranchTargets(
     const std::array<u32, 3>& targets, u32 source_base, u32 captured_instructions) {

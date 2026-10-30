@@ -16,7 +16,7 @@ namespace Hardware {
 constexpr u64 BASE_CLOCK_RATE = 1'020'000'000; // Default CPU Frequency = 1020 MHz
 constexpr u64 CNTFREQ = 19'200'000;            // CNTPCT_EL0 Frequency = 19.2 MHz
 // Switch 1 applications get cores 0..3. Switch 2 applications ask for 0..5 and start a job worker
-// per core: with four, cores 4 and 5 folded onto core 0, so a busy worker there (Pokopia's save)
+// per core: with four, cores 4 and 5 folded onto core 0, so a busy worker there (a save worker)
 // starved the main thread. Switch 1 titles leave cores 4 and 5 idle.
 constexpr u32 NUM_CPU_CORES = 6;               // Number of CPU Cores - sync with dynarmic exclusive_monitor.h
 
