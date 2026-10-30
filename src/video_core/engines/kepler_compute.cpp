@@ -7,6 +7,8 @@
 #include "video_core/native_diagnostics.h"
 #include <bitset>
 #include <fstream>
+#include <string>
+#include <unordered_set>
 #include "common/assert.h"
 #include "common/logging.h"
 #include "shader_recompiler/exception.h"
@@ -309,8 +311,13 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     try {
         rasterizer->DispatchCompute();
     } catch (const Shader::Exception& error) {
-        LOG_CRITICAL(HW_GPU, "Native compute shader rejected: {}", error.what());
-        return false;
+        // Skip only this dispatch: failing the QMD would also drop its semaphore releases,
+        // and the queues waiting on them would hang the game.
+        static std::unordered_set<std::string> reported;
+        if (reported.insert(error.what()).second) {
+            LOG_CRITICAL(HW_GPU, "Native compute shader rejected, dispatch skipped: {}",
+                         error.what());
+        }
     }
     return true;
 }

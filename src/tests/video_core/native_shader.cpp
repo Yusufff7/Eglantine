@@ -3080,12 +3080,22 @@ TEST_CASE("Native capture extension owns the exact three-entry indirect branch t
 
     constexpr std::array invalid_targets{
         std::array<u32, 3>{0x70, 0x1b0, 0x230},  std::array<u32, 3>{0x161, 0x1b0, 0x230},
-        std::array<u32, 3>{0x160, 0x160, 0x230}, std::array<u32, 3>{0x160, 0x230, 0x220},
+        std::array<u32, 3>{0x160, 0x160, 0x230}, std::array<u32, 3>{0x160, 0x230, 0x160},
         std::array<u32, 3>{0x160, 0x230, 0x240}, std::array<u32, 3>{0x160, 0x1b0, 0x100080},
     };
     for (const auto& invalid : invalid_targets) {
         REQUIRE_FALSE(Shader::Ampere::ValidateCaptureIndirectBranchTargets(invalid, 0x80, 27));
     }
+
+    // Pokopia: a case laid out before the first entry.
+    constexpr std::array<u32, 3> unordered_targets{0x5040, 0x4dc0, 0x50c0};
+    const auto unordered =
+        Shader::Ampere::ValidateCaptureIndirectBranchTargets(unordered_targets, 0x80, 1277);
+    REQUIRE(unordered == std::array<u32, 3>{1276, 1236, 1284});
+    REQUIRE_FALSE(Shader::Ampere::CaptureIncludesIndirectBranchTargets(*unordered, 1284));
+    REQUIRE(Shader::Ampere::CaptureIncludesIndirectBranchTargets(*unordered, 1285));
+    REQUIRE_FALSE(
+        Shader::Ampere::ValidateCaptureIndirectBranchTargets(unordered_targets, 0x80, 1276));
 }
 
 TEST_CASE("Captured FastFusion indirect branch extends through every table target",

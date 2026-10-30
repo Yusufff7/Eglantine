@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -114,6 +115,9 @@ class RenderdocAPI;
 }
 
 namespace Core {
+
+// Diagnostic: steady-clock time (ns) of the last native present, for EDEN_DIAG_STALL_DUMP.
+inline std::atomic<s64> g_diag_last_present_ns{0};
 
 class CpuManager;
 class Debugger;

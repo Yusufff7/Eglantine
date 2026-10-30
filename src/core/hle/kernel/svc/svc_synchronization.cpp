@@ -11,6 +11,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc/svc_wait_diagnostics.h"
 #include "core/hle/kernel/svc_results.h"
 
 namespace Kernel::Svc {
@@ -123,6 +124,9 @@ Result WaitSynchronization(Core::System& system, int32_t* out_index, u64 user_ha
     }
     // Wait on the objects.
     Result res = KSynchronizationObject::Wait(system.Kernel(), out_index, objs.data(), num_handles, timeout);
+    if (res == ResultTimedOut) {
+        LogLongTimedOutWait(system, "WaitSynchronization", timeout_ns, num_handles);
+    }
 
     R_SUCCEED_IF(res == ResultSessionClosed);
     R_RETURN(res);

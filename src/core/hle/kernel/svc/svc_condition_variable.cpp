@@ -10,6 +10,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc/svc_wait_diagnostics.h"
 #include "core/hle/kernel/svc_results.h"
 
 namespace Kernel::Svc {
@@ -41,9 +42,12 @@ Result WaitProcessWideKeyAtomic(Core::System& system, u64 address, u64 cv_key, u
     }
 
     // Wait on the condition variable.
-    R_RETURN(
-        GetCurrentProcess(system.Kernel())
-            .WaitConditionVariable(address, Common::AlignDown(cv_key, sizeof(u32)), tag, timeout));
+    const Result result = GetCurrentProcess(system.Kernel())
+            .WaitConditionVariable(address, Common::AlignDown(cv_key, sizeof(u32)), tag, timeout);
+    if (result == ResultTimedOut) {
+        LogLongTimedOutWait(system, "WaitProcessWideKeyAtomic", timeout_ns, cv_key);
+    }
+    R_RETURN(result);
 }
 
 /// Signal process wide key

@@ -514,8 +514,14 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
         }
     }
     if (!lowered) {
-        throw Shader::RuntimeError("Native shader at {:#x}, instruction {:#x}: {}",
-                                   program_base, lowered.error_offset, lowered.error);
+        // The rejected instruction's words say exactly which encoding still needs lowering.
+        const size_t error_index = lowered.error_offset / sizeof(Shader::Ampere::Instruction);
+        const auto words = error_index < native.size() ? native[error_index].words
+                                                       : decltype(native[0].words){};
+        throw Shader::RuntimeError(
+            "Native shader at {:#x}, instruction {:#x}: {} (words {:08x} {:08x} {:08x} {:08x})",
+            program_base, lowered.error_offset, lowered.error, words[0], words[1], words[2],
+            words[3]);
     }
     if (lowered.required_texture_buffer != ~0U) {
         // Native TEX carries its cbuf index explicitly; TEXS obtains it from the environment.

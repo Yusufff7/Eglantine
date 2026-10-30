@@ -333,11 +333,10 @@ void LoopProcess(Core::System& system) {
     server_manager->RegisterNamedService("ngct:s", std::make_shared<IServiceWithManagementApi>(system), 4);
     server_manager->RegisterNamedService("ngc:u", std::make_shared<NgcServiceImpl>(system), 4);
 
-    // +23.0.0
-    if (FirmwareManager::GetFirmwareVersion(system).first.major >= 23) {
-        server_manager->RegisterNamedService("stpl:u", std::make_shared<IUserService>(system), 4);
-        server_manager->RegisterNamedService("stpl:sys", std::make_shared<ISystemService>(system), 4);
-    }
+    // +23.0.0. Registered with any installed firmware: Switch 2 titles (Pokopia) need it at boot,
+    // and an older installed firmware would leave them waiting for the service forever.
+    server_manager->RegisterNamedService("stpl:u", std::make_shared<IUserService>(system), 4);
+    server_manager->RegisterNamedService("stpl:sys", std::make_shared<ISystemService>(system), 4);
 
     ServerManager::RunServer(std::move(server_manager));
 }

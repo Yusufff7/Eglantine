@@ -566,6 +566,8 @@ private:
             });
             system.CoreTiming().ScheduleLoopingEvent(std::chrono::milliseconds{1}, std::chrono::milliseconds{1}, m_release_poll);
         }
+        Core::g_diag_last_present_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                           std::memory_order_relaxed);
         LOG_INFO(Service_AM, "Native image queued for display: image={}, slot={}, fence={}/{}, dimensions={}x{}",
                  image->id, slot, fence_id, packet[24], native->width, native->height);
         R_SUCCEED();

@@ -10,6 +10,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc/svc_wait_diagnostics.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/svc_types.h"
 
@@ -67,8 +68,12 @@ Result WaitForAddress(Core::System& system, u64 address, ArbitrationType arb_typ
         timeout = timeout_ns;
     }
 
-    R_RETURN(
-        GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout));
+    const Result result =
+        GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout);
+    if (result == ResultTimedOut) {
+        LogLongTimedOutWait(system, "WaitForAddress", timeout_ns, address);
+    }
+    R_RETURN(result);
 }
 
 // Signals to an address (via Address Arbiter)

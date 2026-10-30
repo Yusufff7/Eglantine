@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <span>
@@ -73,6 +74,8 @@ inline std::optional<CaptureIndirectBranchTable> TrackCaptureIndirectBranchTable
     return result;
 }
 
+// Table entries need not be ascending: Pokopia has cases laid out before the first one
+// ([0x5040, 0x4dc0, 0x50c0]). Every target but the furthest must already be captured.
 inline std::optional<std::array<u32, 3>> ValidateCaptureIndirectBranchTargets(
     const std::array<u32, 3>& targets, u32 source_base, u32 captured_instructions) {
     std::array<u32, 3> indices{};
@@ -80,20 +83,25 @@ inline std::optional<std::array<u32, 3>> ValidateCaptureIndirectBranchTargets(
         if (targets[i] < source_base || (targets[i] - source_base) % sizeof(Instruction))
             return {};
         const u32 index = (targets[i] - source_base) / sizeof(Instruction);
-        if (index >= MaximumCaptureInstructions || (i != 0 && targets[i] <= targets[i - 1])) {
+        if (index >= MaximumCaptureInstructions)
             return {};
+        for (u32 j = 0; j < i; ++j) {
+            if (indices[j] == index)
+                return {};
         }
         indices[i] = index;
     }
-    if (indices[0] >= captured_instructions || indices[1] >= captured_instructions) {
-        return {};
+    const u32 furthest = *std::ranges::max_element(indices);
+    for (const u32 index : indices) {
+        if (index != furthest && index >= captured_instructions)
+            return {};
     }
     return indices;
 }
 
 inline bool CaptureIncludesIndirectBranchTargets(const std::array<u32, 3>& target_indices,
                                                  u32 captured_instructions) {
-    return captured_instructions > target_indices.back();
+    return captured_instructions > *std::ranges::max_element(target_indices);
 }
 
 class ProgramCaptureState {

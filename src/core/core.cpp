@@ -429,6 +429,21 @@ struct System::Impl {
                 });
             core_timing.ScheduleLoopingEvent(std::chrono::seconds{10}, std::chrono::seconds{30}, thread_dump_event);
         }
+        if (std::getenv("EDEN_DIAG_STALL_DUMP")) {
+            // Dump every guest thread once per stall when no frame was presented for 1.5 s.
+            stall_dump_event = Core::Timing::CreateEvent(
+                "DiagStallDump", [&system, dumped = s64{0}](s64, std::chrono::nanoseconds) mutable -> std::optional<std::chrono::nanoseconds> {
+                    const s64 last = g_diag_last_present_ns.load(std::memory_order_relaxed);
+                    const s64 now = std::chrono::steady_clock::now().time_since_epoch().count();
+                    if (last != 0 && last != dumped && now - last > 1'500'000'000) {
+                        dumped = last;
+                        LOG_INFO(Core, "diag: no present for {} ms", (now - last) / 1'000'000);
+                        system.DumpGuestThreads();
+                    }
+                    return std::nullopt;
+                });
+            core_timing.ScheduleLoopingEvent(std::chrono::milliseconds{250}, std::chrono::milliseconds{250}, stall_dump_event);
+        }
         return SystemResultStatus::Success;
     }
 
@@ -496,6 +511,7 @@ struct System::Impl {
 
     Timing::CoreTiming core_timing;
     std::shared_ptr<Timing::EventType> thread_dump_event;
+    std::shared_ptr<Timing::EventType> stall_dump_event;
     Kernel::KernelCore kernel;
     /// RealVfsFilesystem instance
     FileSys::VirtualFilesystem virtual_filesystem;
