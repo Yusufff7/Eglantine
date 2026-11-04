@@ -7,6 +7,17 @@
 -->
 <!-- lang: en-GB -->
 
+> [!NOTE]
+> **This is an unofficial fork of [Eglantine](https://github.com/Djihads80/Eglantine)** (its `nx2` branch), with optimizations on top.
+>
+> All of the emulator itself is the work of the original Eglantine developers, started by Camille LaVey (CamilleLaVey) with Djihads80, Takoroka and other contributors, and of the Eden, yuzu and Sudachi projects it is derived from. This fork only adds performance and stability optimizations to their work.
+>
+> - `mkw`: performance and stability optimizations
+> - `pkp`: boot and compatibility fixes
+> - `nx2`: the upstream branch, unchanged
+>
+> Please report problems with this fork here, not to the upstream projects.
+
 <h1 align="center">
   <br>
   <a href="https://git.eden-emu.dev/eden-emu/eden"><img src="https://github.com/user-attachments/assets/35031845-4bfa-4916-8bf5-bc3bce67d5e2" alt="Eglantine" width="200"></a>
