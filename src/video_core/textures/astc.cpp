@@ -396,7 +396,7 @@ static TexelWeightParams DecodeBlockInfo(Stream& strm) {
     TexelWeightParams params;
 
     // Read the entire block mode all at once
-    u16 modeBits = static_cast<u16>(strm.ReadBits<11>());
+    u16 modeBits = static_cast<u16>(strm.template ReadBits<11>());
 
     // Does this match the void extent block mode?
     if ((modeBits & 0x01FF) == 0x1FC) {
@@ -2098,18 +2098,18 @@ static bool IsOpaqueWith(std::span<const uint8_t> data) {
             }
             continue;
         }
-        const u32 partitions = strm.ReadBits<2>() + 1;
+        const u32 partitions = strm.template ReadBits<2>() + 1;
         if (partitions == 4 && params.m_bDualPlane) {
             continue;
         }
         if (partitions == 1) {
-            if ((AlphaModes >> strm.ReadBits<4>()) & 1) {
+            if ((AlphaModes >> strm.template ReadBits<4>()) & 1) {
                 return false;
             }
             continue;
         }
-        strm.ReadBits<10>(); // partition index
-        const u32 base_cem = strm.ReadBits<6>();
+        strm.template ReadBits<10>(); // partition index
+        const u32 base_cem = strm.template ReadBits<6>();
         const u32 base_mode = base_cem & 3;
         if (base_mode == 0) {
             if ((AlphaModes >> (base_cem >> 2)) & 1) {

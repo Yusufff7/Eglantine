@@ -129,7 +129,11 @@ public:
         entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         // The job's type (its lambda's, naming the function it was made in), for StallWatch.
+#if defined(__cpp_rtti) || defined(_CPPRTTI) || defined(__GXX_RTTI)
         entry[2] = reinterpret_cast<u64>(typeid(Func).name());
+#else
+        entry[2] = reinterpret_cast<u64>(JobName<Func>());
+#endif
         std::memcpy(entry + 3, &func, sizeof(Func));
         Commit(3 + payload);
         if (ordered) {
@@ -286,6 +290,16 @@ private:
     template <typename Func>
     static void CallThunk(const u64* payload) {
         (*reinterpret_cast<const Func*>(payload))();
+    }
+
+    /// Without RTTI (GCC builds use -fno-rtti), the signature naming Func stands in for typeid.
+    template <typename Func>
+    static const char* JobName() {
+#if defined(_MSC_VER)
+        return __FUNCSIG__;
+#else
+        return __PRETTY_FUNCTION__;
+#endif
     }
 
     /// Room for an entry of `words` at the write position (never across the ring's end).

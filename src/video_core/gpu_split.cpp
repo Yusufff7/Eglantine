@@ -519,11 +519,15 @@ void GpuSplit::ReportStall(const u64* entry, u64 took_ns) {
     const Tegra::Engines::EngineInterface* const engine = back_engine;
     const char* engine_name = "no engine";
     if (engine != nullptr) {
+#if defined(__cpp_rtti) || defined(_CPPRTTI) || defined(__GXX_RTTI)
         try {
             engine_name = typeid(*engine).name();
         } catch (...) {
             engine_name = "engine";
         }
+#else
+        engine_name = "engine";
+#endif
     }
     const u64 detail = (head >> 8) & 0xffff;
     if (kind == Kind::Call) {
