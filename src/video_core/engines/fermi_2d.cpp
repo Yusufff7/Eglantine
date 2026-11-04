@@ -93,8 +93,19 @@ void Fermi2D::Blit() {
     constexpr s64 null_derivative = 1ULL << 32;
     Surface src = regs.src;
     const auto bytes_per_pixel = BytesPerBlock(PixelFormatFromRenderTargetFormat(src.format));
-    const bool delegate_to_gpu = src.width > 512 && src.height > 512 && bytes_per_pixel <= 8 &&
-                                 src.format != regs.dst.format;
+    // EDEN_NX2_BLIT_GPU=1: large copies between block-linear surfaces go to the GPU too. Off:
+    // MKW's 16-64 MiB RGBA32F copies into GPU-only memory then sampled as garbage.
+    static const bool large_to_gpu = [] {
+        const char* value = std::getenv("EDEN_NX2_BLIT_GPU");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool large_block_copy =
+        large_to_gpu && src.linear == MemoryLayout::BlockLinear &&
+        regs.dst.linear == MemoryLayout::BlockLinear &&
+        u64{src.width} * src.height * bytes_per_pixel >= (u64{1} << 20);
+    const bool delegate_to_gpu = (src.width > 512 && src.height > 512 && bytes_per_pixel <= 8 &&
+                                  src.format != regs.dst.format) ||
+                                 large_block_copy;
 
     auto srcX = args.src_x0;
     auto srcY = args.src_y0;

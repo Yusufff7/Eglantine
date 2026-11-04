@@ -6,11 +6,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <map>
 #include <limits>
 #include <string>
 #include <thread>
 
 #include "common/adpf.h"
+#include "common/nx2_trace.h"
 #include "common/error.h"
 #include "common/logging.h"
 #include "common/assert.h"
@@ -504,6 +506,7 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 }
 
 void SetCurrentThreadName(const char* name) {
+    Common::Nx2Trace::NameHostThread(name);
 #ifdef _MSC_VER
     // Sets the debugger-visible name of the current thread.
     if (auto pf = (decltype(&SetThreadDescription))(void*)GetProcAddress(GetModuleHandle(TEXT("KernelBase.dll")), "SetThreadDescription"); pf)
@@ -546,6 +549,89 @@ void SetCurrentThreadToPerformanceCores() {
         return;
     }
     SetCurrentThreadCoreGroup(CoreGroup::Performance);
+#endif
+}
+
+void PinCurrentThreadToDedicatedCore(unsigned slot) {
+#ifdef _WIN32
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_PIN");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    struct Core {
+        ULONG first_set;    ///< CPU set id of the core's first logical processor
+        std::vector<ULONG> sets;
+    };
+    static std::mutex mutex;
+    static std::vector<Core> performance_cores;
+    static std::vector<ULONG> all_sets;
+    static std::vector<bool> reserved;
+    std::scoped_lock lock{mutex};
+    if (all_sets.empty()) {
+        ULONG length = 0;
+        GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+        std::vector<u8> buffer(length);
+        auto* const info = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
+        if (!GetSystemCpuSetInformation(info, length, &length, GetCurrentProcess(), 0)) {
+            return;
+        }
+        BYTE best_class = 0;
+        for (size_t offset = 0; offset < length;) {
+            const auto& entry = *reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+            if (entry.Type == CpuSetInformation) {
+                best_class = (std::max)(best_class, entry.CpuSet.EfficiencyClass);
+            }
+            offset += entry.Size;
+        }
+        std::map<BYTE, Core> by_core;
+        for (size_t offset = 0; offset < length;) {
+            const auto& entry = *reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+            if (entry.Type == CpuSetInformation) {
+                all_sets.push_back(entry.CpuSet.Id);
+                if (entry.CpuSet.EfficiencyClass == best_class) {
+                    auto& core = by_core[entry.CpuSet.CoreIndex];
+                    if (core.sets.empty()) {
+                        core.first_set = entry.CpuSet.Id;
+                    }
+                    core.sets.push_back(entry.CpuSet.Id);
+                }
+            }
+            offset += entry.Size;
+        }
+        for (auto& [index, core] : by_core) {
+            performance_cores.push_back(core);
+        }
+        reserved.assign(performance_cores.size(), false);
+    }
+    // The last cores, away from core 0 (interrupts) and from what the system favours.
+    if (slot >= performance_cores.size() / 2) {
+        return;
+    }
+    const size_t core_index = performance_cores.size() - 1 - slot;
+    const Core& core = performance_cores[core_index];
+    reserved[core_index] = true;
+    std::vector<ULONG> others;
+    for (const ULONG id : all_sets) {
+        bool taken = false;
+        for (size_t i = 0; i < performance_cores.size() && !taken; ++i) {
+            taken = reserved[i] && std::find(performance_cores[i].sets.begin(),
+                                             performance_cores[i].sets.end(), id) !=
+                                       performance_cores[i].sets.end();
+        }
+        if (!taken) {
+            others.push_back(id);
+        }
+    }
+    SetProcessDefaultCpuSets(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size()));
+    const ULONG mine = core.first_set;
+    SetThreadSelectedCpuSets(GetCurrentThread(), &mine, 1);
+    LOG_INFO(Common, "Thread pinned to performance core {} (CPU set {}), {} CPU sets for the rest",
+             core_index, mine, others.size());
+#else
+    (void)slot;
 #endif
 }
 

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "common/nx2_trace.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
@@ -170,6 +171,7 @@ public:
             return;
         }
 
+        Common::Nx2Trace::Scope trace{"gpu wait", "host GPU wait: quad index buffer"};
         scheduler.Finish();
 
         num_indices = num_indices_;
@@ -427,10 +429,12 @@ bool BufferCacheRuntime::IsFree(u64 tick) {
 }
 
 void BufferCacheRuntime::Wait(u64 tick) {
+    Common::Nx2Trace::Scope trace{"gpu wait", "host GPU wait: buffer cache"};
     scheduler.Wait(tick);
 }
 
 void BufferCacheRuntime::Finish() {
+    Common::Nx2Trace::Scope trace{"gpu wait", "host GPU wait: buffer cache finish"};
     scheduler.Finish();
 }
 

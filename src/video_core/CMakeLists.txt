@@ -34,6 +34,9 @@ add_library(video_core STATIC
     control/channel_state_cache.h
     control/scheduler.cpp
     control/scheduler.h
+    background_destroyer.h
+    nx2_sampler.cpp
+    nx2_sampler.h
     delayed_destruction_ring.h
     dirty_flags.cpp
     dirty_flags.h
@@ -432,6 +435,9 @@ endif()
 target_include_directories(video_core PUBLIC ${FFmpeg_INCLUDE_DIR})
 
 target_link_libraries(video_core PRIVATE ${FFmpeg_LIBRARIES})
+if (WIN32)
+    target_link_libraries(video_core PRIVATE dbghelp winmm)
+endif()
 target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
 
 add_dependencies(video_core host_shaders)

@@ -10,6 +10,8 @@
 #include <cstring>
 #include <type_traits>
 
+#include "common/nx2_trace.h"
+#include "common/scope_exit.h"
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
@@ -2523,6 +2525,44 @@ void Call(Core::System& system, u32 imm) {
                  GetCurrentThread(kernel).GetThreadId(),
                  GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2), GetArg64(args, 3));
     }
+    const u64 trace_begin = Common::Nx2Trace::Active() ? Common::Nx2Trace::Now() : 0;
+    const u64 trace_args[3]{GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2)};
+    SCOPE_EXIT {
+        if (trace_begin == 0 || !Common::Nx2Trace::Active()) {
+            return;
+        }
+        const u64 trace_end = Common::Nx2Trace::Now();
+        if (trace_end - trace_begin < 3000) {
+            return; // Under 3 us: no wait.
+        }
+        static constexpr std::pair<u32, const char*> names[]{
+            {0x01, "SetHeapSize"},       {0x0b, "SleepThread"},
+            {0x11, "SignalEvent"},       {0x12, "ClearEvent"},
+            {0x13, "MapSharedMemory"},   {0x16, "CloseHandle"},
+            {0x17, "ResetSignal"},       {0x18, "WaitSynchronization"},
+            {0x19, "CancelSynchronization"}, {0x1a, "ArbitrateLock"},
+            {0x1b, "ArbitrateUnlock"},   {0x1c, "WaitProcessWideKeyAtomic"},
+            {0x1d, "SignalProcessWideKey"}, {0x1f, "ConnectToNamedPort"},
+            {0x21, "SendSyncRequest"},   {0x22, "SendSyncRequestWithUserBuffer"},
+            {0x29, "GetInfo"},           {0x2c, "MapPhysicalMemory"},
+            {0x34, "WaitForAddress"},    {0x35, "SignalToAddress"},
+            {0x43, "ReplyAndReceive"},   {0x80, "SetGpuMemoryAttribute"},
+        };
+        const char* name = nullptr;
+        for (const auto& [number, text] : names) {
+            if (number == imm) {
+                name = text;
+            }
+        }
+        auto& thread = GetCurrentThread(kernel);
+        const u64 id = thread.GetThreadId();
+        Common::Nx2Trace::NameGuestThread(id, fmt::format("t{} prio {}", id, thread.GetPriority()));
+        Common::Nx2Trace::GuestSpan(
+            "svc", name != nullptr ? std::string{name} : fmt::format("svc {:#x}", imm), id,
+            trace_begin, trace_end,
+            fmt::format("{:#x} {:#x} {:#x} -> {:#x}", trace_args[0], trace_args[1],
+                        trace_args[2], GetArg64(args, 0)));
+    };
     if (imm == 0x80) {
         // Switch 2 only: svcSetGpuMemoryAttribute(address, size, mask, attr). nn::gpu::sdk and
         // nn::gs native memory set the new "GPU accessible" attribute (0x20) before registering

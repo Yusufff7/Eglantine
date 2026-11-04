@@ -35,6 +35,13 @@ void ShaderCache::InvalidateRegion(VAddr addr, size_t size) {
     RemovePendingShaders();
 }
 
+bool ShaderCache::InvalidateRegionFound(VAddr addr, size_t size) {
+    std::scoped_lock lock{invalidation_mutex};
+    const bool found = InvalidatePagesInRegion(addr, size);
+    RemovePendingShaders();
+    return found;
+}
+
 void ShaderCache::OnCacheInvalidation(VAddr addr, size_t size) {
     std::scoped_lock lock{invalidation_mutex};
     InvalidatePagesInRegion(addr, size);
@@ -180,6 +187,7 @@ bool ShaderCache::IsRejected(VAddr addr) {
 void ShaderCache::RememberRejection(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
     rejected_native.emplace(addr, std::current_exception());
+    registration_generation.fetch_add(1, std::memory_order_acq_rel);
     rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), addr),
                           std::memory_order_relaxed);
     rejected_highest.store((std::max)(rejected_highest.load(std::memory_order_relaxed), addr),
@@ -228,14 +236,16 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t 
     for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {
         invalidation_cache[page].push_back(entry);
     }
+    registration_generation.fetch_add(1, std::memory_order_acq_rel);
 
     storage.push_back(std::move(data));
 
     device_memory.UpdatePagesCachedCount(addr, size, 1);
 }
 
-void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
+bool ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
     const VAddr addr_end = addr + size;
+    bool found = false;
     // Rejected programs are few and in a few places: look at them only for writes that can
     // reach them (this runs for every inline upload and pre-draw invalidation).
     if (addr_end > rejected_lowest.load(std::memory_order_relaxed) &&
@@ -244,6 +254,7 @@ void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
         boost::unordered::erase_if(rejected_native, [&](const auto& rejected) {
             return rejected.first >= addr && rejected.first < addr_end;
         });
+        found = true;
     }
     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
     for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {
@@ -251,8 +262,10 @@ void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
         if (it == invalidation_cache.end()) {
             continue;
         }
+        found = true;
         InvalidatePageEntries(it->second, addr, addr_end);
     }
+    return found;
 }
 
 void ShaderCache::RemovePendingShaders() {

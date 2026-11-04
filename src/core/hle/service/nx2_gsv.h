@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "common/alignment.h"
+#include "common/nx2_trace.h"
 #include "common/div_ceil.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -41,6 +42,7 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/k_system_resource.h"
 #include "core/hle/kernel/k_memory_manager.h"
+#include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/k_page_group.h"
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_server_session.h"
@@ -325,6 +327,14 @@ public:
     ~INx2GpuSession() override {
         // Waits for a backing the GPU thread may be doing.
         Tegra::Nx2SetSparseBacking({});
+        if (m_prefill_thread.joinable()) {
+            m_prefill_thread.request_stop();
+            m_prefill_thread.join();
+        }
+        for (auto& pages : m_ready_blocks) {
+            pages->Close(system.Kernel());
+        }
+        m_ready_blocks.clear();
         for (auto* event : m_events) {
             if (event != nullptr) {
                 m_context.CloseEvent(event);
@@ -630,36 +640,57 @@ private:
         });
     }
 
+    /// `busy` (the GPU thread): don't wait for the kernel's pool or page table locks; sets
+    /// *busy and returns nullopt if one is held.
     std::optional<u64> BackGpuOnlyRegion(u64 gpu_address, u64 size, bool log_failure = true,
-                                         bool clear = false) {
+                                         bool clear = false, bool* busy = nullptr) {
         using Core::Memory::YUZU_PAGESIZE;
+        const auto step_start = std::chrono::steady_clock::now();
         auto& kernel_core = system.Kernel();
         auto* const process = system.ApplicationProcess();
         if (process == nullptr) {
             return std::nullopt;
         }
-        auto pg = std::make_unique<Kernel::KPageGroup>(
-            kernel_core, std::addressof(kernel_core.GetSystemSystemResource().GetBlockInfoManager()));
+        std::unique_ptr<Kernel::KPageGroup> pg;
+        if (busy != nullptr && size == SparseBlockSize) {
+            pg = TakeReadyBlock();
+        }
+        const bool pooled = pg != nullptr;
+        if (!pooled) {
+            pg = std::make_unique<Kernel::KPageGroup>(
+                kernel_core, std::addressof(kernel_core.GetSystemSystemResource().GetBlockInfoManager()));
+        }
         // The graphics server's own memory, not the application's: taken from the application
         // pool, title 4's six regions left it 1.8 GB less than the kernel reports to it. Not
         // cleared: the GPU writes these before reading them, and touching 300 MB would commit it
         // on the host.
-        if (R_FAILED(kernel_core.MemoryManager().AllocateAndOpen(
-                pg.get(), size / YUZU_PAGESIZE,
-                Kernel::KMemoryManager::EncodeOption(Kernel::KMemoryManager::Pool::SystemNonSecure,
-                                                     Kernel::KMemoryManager::Direction::FromBack)))) {
+        const u32 option =
+            Kernel::KMemoryManager::EncodeOption(Kernel::KMemoryManager::Pool::SystemNonSecure,
+                                                 Kernel::KMemoryManager::Direction::FromBack);
+        const Result allocated =
+            pooled ? ResultSuccess :
+            busy != nullptr
+                ? kernel_core.MemoryManager().TryAllocateAndOpen(pg.get(), size / YUZU_PAGESIZE, option)
+                : kernel_core.MemoryManager().AllocateAndOpen(pg.get(), size / YUZU_PAGESIZE, option);
+        if (busy != nullptr && allocated == Kernel::ResultBusy) {
+            *busy = true;
+            return std::nullopt;
+        }
+        if (R_FAILED(allocated)) {
             if (log_failure) {
                 LOG_ERROR(Service, "nx2:gpu 214 could not allocate {:#x} bytes", size);
             }
             return std::nullopt;
         }
-        if (clear) {
+        const auto step_allocated = std::chrono::steady_clock::now();
+        if (clear && !pooled) {
             // Cheap for memory that's still zero (most of it): only reused pages get cleared.
             for (const auto& block : *pg) {
                 system.DeviceMemory().buffer.ClearBackingRegion(
                     GetInteger(block.GetAddress()) - Core::DramMemoryMap::Base, block.GetSize(), 0);
             }
         }
+        const auto step_cleared = std::chrono::steady_clock::now();
         auto& page_table = process->GetPageTable();
         const u64 region_start = GetInteger(page_table.GetAliasCodeRegionStart());
         const u64 region_size = page_table.GetAliasCodeRegionSize();
@@ -672,8 +703,25 @@ private:
                 continue;
             }
             const Common::ProcessAddress address{region_start + offset};
-            if (R_SUCCEEDED(page_table.MapPageGroup(address, *pg, Kernel::KMemoryState::IoMemory,
-                                                    Kernel::KMemoryPermission::UserReadWrite))) {
+            const Result mapped = page_table.MapPageGroup(address, *pg, Kernel::KMemoryState::IoMemory,
+                                                          Kernel::KMemoryPermission::UserReadWrite,
+                                                          busy != nullptr);
+            if (mapped == Kernel::ResultBusy) {
+                *busy = true;
+                pg->Close(kernel_core);
+                return std::nullopt;
+            }
+            if (R_SUCCEEDED(mapped)) {
+                const auto step_mapped = std::chrono::steady_clock::now();
+                const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+                size_t page_blocks = 0;
+                for ([[maybe_unused]] const auto& block : *pg) {
+                    ++page_blocks;
+                }
+                m_last_back_detail = fmt::format("{} {:.2f} in {} blocks, clear {:.2f}, map {:.2f}",
+                                                 pooled ? "ready block" : "allocate",
+                                                 ms(step_allocated - step_start), page_blocks,
+                                                 ms(step_cleared - step_allocated), ms(step_mapped - step_cleared));
                 m_alias_hint = (offset + Common::AlignUp(size, Alignment)) / Alignment;
                 m_gpu_only_regions[gpu_address] = {GetInteger(address), size, std::move(pg)};
                 m_gpu_only_bytes += size;
@@ -692,7 +740,50 @@ private:
     // region's device pages. The GPU mapping stays as it is, so the images over the region keep
     // their storage and only see the write.
     void BackSparseWrite(u64 gpu_address, u64 size) {
+        // The GPU thread must not wait in the guest kernel's locks: a thread holding one may wait
+        // for the GPU (and a host thread's kernel wait can miss its wake-up). Try them, and while
+        // one is held, let go of the region mutex too so the graphics server's commands can run.
+        const auto start = std::chrono::steady_clock::now();
+        for (u32 attempt = 0;; ++attempt) {
+            if (!BackSparseWriteOnce(gpu_address, size)) {
+                return;
+            }
+            if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds{250}) {
+                if (m_busy_warnings++ < 8) {
+                    const auto describe = [](Kernel::KThread* owner) -> std::string {
+                        if (owner == nullptr) {
+                            return "free";
+                        }
+                        return fmt::format("thread {} ({})", owner->GetThreadId(),
+                                           owner->IsDummyThread() ? "host" : "guest");
+                    };
+                    auto* const process = system.ApplicationProcess();
+                    LOG_WARNING(Service,
+                                "nx2:gpu kernel memory locks held for 250 ms: GPU write to {:#x}+{:#x} "
+                                "lands in unbacked sparse blocks (page table lock: {}, pool lock: {})",
+                                gpu_address, size,
+                                process != nullptr
+                                    ? describe(process->GetPageTable().GetBasePageTable().GetGeneralLockOwner())
+                                    : std::string{"no process"},
+                                describe(system.Kernel().MemoryManager().GetPoolLockOwner(
+                                    Kernel::KMemoryManager::Pool::SystemNonSecure)));
+                }
+                return;
+            }
+            if (attempt < 64) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds{200});
+            }
+        }
+    }
+
+    /// Backs the empty sparse blocks under a write; true if a kernel lock was held (try again).
+    bool BackSparseWriteOnce(u64 gpu_address, u64 size) {
         std::scoped_lock lk{m_region_mutex};
+        if (!m_prefill_thread.joinable() && SparsePrefill()) {
+            m_prefill_thread = std::jthread([this](std::stop_token token) { PrefillLoop(token); });
+        }
         const u64 end = gpu_address + size;
         auto it = m_sparse_regions.upper_bound(gpu_address);
         if (it != m_sparse_regions.begin()) {
@@ -711,7 +802,17 @@ private:
                 }
                 const u64 block_address = start + block * SparseBlockSize;
                 const u64 block_size = (std::min)(SparseBlockSize, region.size - block * SparseBlockSize);
-                const auto address = BackGpuOnlyRegion(block_address, block_size, false, true);
+                // A block the write covers whole needs no clearing first (a 64 MiB texture
+                // copy cleared 64 MiB and then wrote it).
+                const bool covered = block_address >= gpu_address && block_address + block_size <= end;
+                bool busy = false;
+                const auto back_start = std::chrono::steady_clock::now();
+                const auto address =
+                    BackGpuOnlyRegion(block_address, block_size, false, !covered, &busy);
+                const auto backed = std::chrono::steady_clock::now();
+                if (busy) {
+                    return true;
+                }
                 if (!address) {
                     region.blocks[block] = BlockFailed; // out of memory: not again for every write
                     if (!region.warned) {
@@ -725,7 +826,17 @@ private:
                 region.blocks[block] = BlockBacked;
                 Nvidia::Devices::Nx2GpuMemoryRegistry::Get().BackSparse(block_address, *address,
                                                                         block_size);
+                const auto listened = std::chrono::steady_clock::now();
                 Tegra::Nx2SparseBlockWritten(start, block);
+                if (const auto took = std::chrono::steady_clock::now() - back_start;
+                    took > std::chrono::milliseconds{1} && m_slow_block_logs++ < 400) {
+                    const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+                    LOG_WARNING(Service, "nx2:gpu sparse block {:#x} backed in {:.2f} ms (kernel {:.2f} [{}], "
+                                         "device mapping {:.2f}, block written {:.2f}), cleared {}",
+                                block_address, ms(took), ms(backed - back_start), m_last_back_detail,
+                                ms(listened - backed), ms(std::chrono::steady_clock::now() - listened),
+                                !covered);
+                }
                 m_sparse_backed_bytes += block_size;
                 if (++m_sparse_blocks == 1 || (m_sparse_blocks % 64) == 0) {
                     LOG_INFO(Service, "nx2:gpu {} sparse blocks backed ({} MiB); {} MiB of GPU-only "
@@ -734,6 +845,68 @@ private:
                              m_gpu_only_peak >> 20);
                 }
             }
+        }
+        return false;
+    }
+
+    // Backing a sparse block on the GPU thread took 1.4-2.3 ms, nearly all of it clearing 4 MiB
+    // of host memory touched for the first time (a page fault per page): a 16 MiB texture copy
+    // into a fresh sparse texture lost 15-25 ms. A thread keeps a few blocks allocated and
+    // cleared ahead. EDEN_NX2_SPARSE_PREFILL=0: allocate and clear on the GPU thread.
+    static bool SparsePrefill() {
+        static const bool prefill = [] {
+            const char* value = std::getenv("EDEN_NX2_SPARSE_PREFILL");
+            return value == nullptr || value[0] != '0';
+        }();
+        return prefill;
+    }
+
+    std::unique_ptr<Kernel::KPageGroup> TakeReadyBlock() {
+        std::unique_ptr<Kernel::KPageGroup> pages;
+        {
+            std::scoped_lock lk{m_ready_mutex};
+            if (m_ready_blocks.empty()) {
+                return nullptr;
+            }
+            pages = std::move(m_ready_blocks.front());
+            m_ready_blocks.pop_front();
+        }
+        m_ready_wake.notify_one();
+        return pages;
+    }
+
+    void PrefillLoop(std::stop_token token) {
+        using Core::Memory::YUZU_PAGESIZE;
+        Common::SetCurrentThreadName("nx2:SparsePrefill");
+        auto& kernel_core = system.Kernel();
+        const u32 option =
+            Kernel::KMemoryManager::EncodeOption(Kernel::KMemoryManager::Pool::SystemNonSecure,
+                                                 Kernel::KMemoryManager::Direction::FromBack);
+        while (!token.stop_requested()) {
+            {
+                std::unique_lock lk{m_ready_mutex};
+                m_ready_wake.wait(lk, token, [this] { return m_ready_blocks.size() < ReadyBlocks; });
+            }
+            if (token.stop_requested()) {
+                break;
+            }
+            auto pages = std::make_unique<Kernel::KPageGroup>(
+                kernel_core, std::addressof(kernel_core.GetSystemSystemResource().GetBlockInfoManager()));
+            // Never wait in the kernel's locks (a guest thread holding one may wait for the GPU).
+            const Result allocated = kernel_core.MemoryManager().TryAllocateAndOpen(
+                pages.get(), SparseBlockSize / YUZU_PAGESIZE, option);
+            if (R_FAILED(allocated)) {
+                std::this_thread::sleep_for(allocated == Kernel::ResultBusy
+                                                ? std::chrono::milliseconds{1}
+                                                : std::chrono::milliseconds{250});
+                continue;
+            }
+            for (const auto& block : *pages) {
+                system.DeviceMemory().buffer.ClearBackingRegion(
+                    GetInteger(block.GetAddress()) - Core::DramMemoryMap::Base, block.GetSize(), 0);
+            }
+            std::scoped_lock lk{m_ready_mutex};
+            m_ready_blocks.push_back(std::move(pages));
         }
     }
 
@@ -757,6 +930,14 @@ private:
         bool warned{};          ///< Logged that the pool ran out for its blocks
     };
     std::map<u64, SparseRegion> m_sparse_regions; ///< By GPU address
+    u32 m_busy_warnings{};
+    u32 m_slow_block_logs{};
+    static constexpr size_t ReadyBlocks = 16; ///< 64 MiB allocated and cleared ahead
+    std::mutex m_ready_mutex;
+    std::condition_variable_any m_ready_wake;
+    std::deque<std::unique_ptr<Kernel::KPageGroup>> m_ready_blocks;
+    std::jthread m_prefill_thread; ///< Declared last of these: stopped before they go
+    std::string m_last_back_detail; ///< Step timings of the last BackGpuOnlyRegion
     u64 m_sparse_blocks{};       ///< Sparse blocks backed so far
     u64 m_sparse_backed_bytes{}; ///< Sparse region memory given out so far
     u64 m_gpu_only_bytes{};      ///< Backing of GPU-only regions and sparse blocks right now
@@ -979,7 +1160,8 @@ private:
     void PresentClientBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
-        Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
+        Common::Nx2Trace::OnPresent(
+            Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed) + 1);
         if (m_presents <= 4 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
                      u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);

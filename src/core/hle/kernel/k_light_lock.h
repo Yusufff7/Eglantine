@@ -11,11 +11,17 @@ namespace Kernel {
 
 class KernelCore;
 
+class KThread;
+
 class KLightLock {
 public:
     explicit KLightLock(KernelCore& kernel) : m_kernel{kernel} {}
 
     void Lock();
+
+    /// Takes the lock if it is free, without waiting: for host threads that must not block on
+    /// a guest kernel lock (the GPU thread, whose waits can depend on threads holding it).
+    bool TryLock();
 
     void Unlock();
 
@@ -28,6 +34,11 @@ public:
     }
 
     bool IsLockedByCurrentThread() const;
+
+    /// The thread holding the lock (debugging: who keeps it), or null.
+    KThread* GetOwner() const {
+        return reinterpret_cast<KThread*>(m_tag.load(std::memory_order_relaxed) & ~uintptr_t{1});
+    }
 
 private:
     std::atomic<uintptr_t> m_tag{};

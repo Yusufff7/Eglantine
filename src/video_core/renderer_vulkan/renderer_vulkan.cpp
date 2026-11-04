@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -202,18 +204,67 @@ RendererVulkan::~RendererVulkan() {
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    // A composite holding the GPU thread for a frame or more is a stutter: log its steps.
+    using Clock = std::chrono::steady_clock;
+    std::array<Clock::time_point, 6> marks{};
+    marks[0] = Clock::now();
     SCOPE_EXIT {
         render_window.OnFrameDisplayed();
+        const auto end = Clock::now();
+        if (end - marks[0] > std::chrono::milliseconds{20}) {
+            static u32 logged{};
+            if (logged++ < 64) {
+                // Steps a headless or hidden frame skips are left unset: count them as 0.
+                const auto span = [&](size_t from, size_t to) {
+                    if (marks[from] == Clock::time_point{}) {
+                        return 0.0;
+                    }
+                    const auto until = to < marks.size() ? marks[to] : end;
+                    return until == Clock::time_point{}
+                               ? 0.0
+                               : std::chrono::duration<double, std::milli>(until - marks[from]).count();
+                };
+                const bool drawn = marks[2] != Clock::time_point{};
+                LOG_WARNING(Render_Vulkan,
+                            "Slow composite: {:.1f} ms (capture layer {:.1f}, screenshot {:.1f}, "
+                            "draw {:.1f}, present {:.1f}, flush {:.1f}, frame end {:.1f})",
+                            std::chrono::duration<double, std::milli>(end - marks[0]).count(),
+                            span(0, 1), span(1, drawn ? 2 : 4), span(2, 3), span(3, 4), span(4, 5),
+                            span(5, marks.size()));
+            }
+        }
     };
 
     RenderAppletCaptureLayer(framebuffers);
+    marks[1] = Clock::now();
 
+    // Frames not drawn into the window still end: the caches collect garbage per frame
+    // (TickFrame), and without it they filled video memory until images no longer fit.
+    const auto end_frame_without_present = [this, &marks] {
+        marks[4] = Clock::now();
+        scheduler.Flush();
+        marks[5] = Clock::now();
+        gpu.RendererFrameEndNotify();
+        rasterizer.TickFrame();
+    };
     if (!render_window.IsShown()) {
+        end_frame_without_present();
         return;
     }
 
     RenderScreenshot(framebuffers);
+    // EDEN_NX2_NO_PRESENT=1 (unattended benchmarks): everything but drawing into the window,
+    // which blocks on a locked or sleeping display.
+    static const bool no_present = [] {
+        const char* value = std::getenv("EDEN_NX2_NO_PRESENT");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (no_present) {
+        end_frame_without_present();
+        return;
+    }
     Frame* frame = present_manager.GetRenderFrame();
+    marks[2] = Clock::now();
 
     scheduler.RequestOutsideRenderPassOperationContext();
     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
@@ -237,13 +288,16 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     }
 #endif
 
+    marks[3] = Clock::now();
     scheduler.Flush(*frame->render_ready);
 
     present_manager.Present(frame);
+    marks[4] = Clock::now();
 #ifdef HAS_LSFG
     scheduler.DispatchWork();
 #endif
 
+    marks[5] = Clock::now();
     gpu.RendererFrameEndNotify();
     rasterizer.TickFrame();
 }
@@ -358,8 +412,12 @@ void RendererVulkan::RenderAppletCaptureLayer(
     }
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    blit_applet.DrawToFrame(device, rasterizer, &applet_frame, capture_layers, VideoCore::Capture::Layout, 1,
-                            CaptureFormat);
+    // Three sets of the layer's resources, as for the window: with one, every frame waited
+    // for the GPU to finish the previous one (its capture draw, submitted after all of it),
+    // 15-60 ms on the GPU thread in heavy frames. The draws into the image stay in order.
+    constexpr size_t CaptureResourceSets = 3;
+    blit_applet.DrawToFrame(device, rasterizer, &applet_frame, capture_layers,
+                            VideoCore::Capture::Layout, CaptureResourceSets, CaptureFormat);
 }
 
 } // namespace Vulkan

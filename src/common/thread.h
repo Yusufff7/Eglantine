@@ -108,6 +108,11 @@ enum class ThreadPlacement : u32 {
 void SetCurrentThreadPriority(ThreadPriority new_priority);
 void SetCurrentThreadName(const char* name);
 void SetCurrentThreadToPerformanceCores();
+
+/// EDEN_NX2_PIN=1 (Windows): gives the calling thread a performance core of its own, `slot` 0
+/// the first, 1 the next, and moves the process's other threads off those cores (CPU sets). For
+/// the threads that bound a frame (the split GPU thread's two halves). Does nothing otherwise.
+void PinCurrentThreadToDedicatedCore(unsigned slot);
 void SetCurrentThreadToEfficiencyCores();
 void SetCurrentThreadToBackgroundWork();
 void SetCurrentThreadToAllCores();

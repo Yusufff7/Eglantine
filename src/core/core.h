@@ -118,6 +118,8 @@ namespace Core {
 
 /// Frames the guest has presented (Switch 2 vi2 present calls); input replay is locked to it.
 extern std::atomic<u64> g_nx2_present_count;
+/// g_nx2_present_count at the guest's last file read (the key script waits for loads with it).
+extern std::atomic<u64> g_nx2_last_read_present;
 
 class CpuManager;
 class Debugger;

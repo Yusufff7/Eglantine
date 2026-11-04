@@ -558,11 +558,16 @@ public:
                     KMemoryPermission perm);
     Result UnmapPages(KProcessAddress address, size_t num_pages, KMemoryState state);
 
+    /// The thread holding the table's lock (debugging), or null.
+    KThread* GetGeneralLockOwner() const {
+        return m_general_lock.GetOwner();
+    }
+
     Result MapPageGroup(KProcessAddress* out_addr, const KPageGroup& pg,
                         KProcessAddress region_start, size_t region_num_pages, KMemoryState state,
                         KMemoryPermission perm);
     Result MapPageGroup(KProcessAddress address, const KPageGroup& pg, KMemoryState state,
-                        KMemoryPermission perm);
+                        KMemoryPermission perm, bool try_lock = false);
     Result UnmapPageGroup(KProcessAddress address, const KPageGroup& pg, KMemoryState state);
 
     Result MakeAndOpenPageGroup(KPageGroup* out, KProcessAddress address, size_t num_pages,

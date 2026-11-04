@@ -65,6 +65,15 @@ public:
     /// @param size Number of bytes of the invalidation
     void InvalidateRegion(VAddr addr, size_t size);
 
+    /// InvalidateRegion, returning whether the region held any shader or rejected program.
+    bool InvalidateRegionFound(VAddr addr, size_t size);
+
+    /// Moves whenever a shader or rejected program is registered: a region an invalidation
+    /// found empty stays empty while it does not.
+    [[nodiscard]] u64 RegistrationGeneration() const {
+        return registration_generation.load(std::memory_order_acquire);
+    }
+
     /// @brief Unmarks a memory region as cached and marks it for removal
     /// @param addr Start address of the CPU write operation
     /// @param size Number of bytes of the CPU write operation
@@ -116,7 +125,8 @@ private:
 
     /// @brief Invalidate pages in a given region
     /// @pre invalidation_mutex is locked
-    void InvalidatePagesInRegion(VAddr addr, size_t size);
+    /// Returns whether any page of the region held a shader, or a rejected program was there.
+    bool InvalidatePagesInRegion(VAddr addr, size_t size);
 
     /// @brief Remove shaders marked for deletion
     /// @pre invalidation_mutex is locked
@@ -167,6 +177,7 @@ private:
     std::mutex rejected_mutex;
     ::Common::unordered_map<u64, std::exception_ptr> rejected_native;
     /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
+    std::atomic<u64> registration_generation{};
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
 };

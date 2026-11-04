@@ -8,8 +8,10 @@
 // <http://gamma.cs.unc.edu/FasTC/>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -18,6 +20,7 @@
 
 #include "common/alignment.h"
 #include "common/common_types.h"
+#include "common/logging.h"
 #include <ranges>
 #include "video_core/textures/astc.h"
 #include "video_core/textures/workers.h"
@@ -388,7 +391,8 @@ struct TexelWeightParams {
     }
 };
 
-static TexelWeightParams DecodeBlockInfo(InputBitStream& strm) {
+template <typename Stream>
+static TexelWeightParams DecodeBlockInfo(Stream& strm) {
     TexelWeightParams params;
 
     // Read the entire block mode all at once
@@ -2038,14 +2042,50 @@ void Decompress(std::span<const uint8_t> data, uint32_t width, uint32_t height, 
     }
 }
 
-bool IsOpaque(std::span<const uint8_t> data) {
+/// Reads one 128-bit block's low bits with shifts (InputBitStream goes bit by bit: an opacity scan
+/// of a texture spent most of its time there).
+class BlockBits {
+public:
+    explicit BlockBits(std::span<const u8> block) {
+        std::memcpy(&low, block.data(), 8);
+        std::memcpy(&high, block.data() + 8, 8);
+    }
+
+    bool ReadBit() {
+        return ReadBits<1>() != 0;
+    }
+
+    template <std::size_t nBits>
+    u32 ReadBits() {
+        static_assert(nBits > 0 && nBits <= 32);
+        u64 value = low >> position;
+        if (position + nBits > 64) {
+            value |= position == 0 ? 0 : high << (64 - position);
+        }
+        position += nBits;
+        if (position >= 64) {
+            position -= 64;
+            low = high;
+            high = 0;
+        }
+        return static_cast<u32>(value & ((u64{1} << nBits) - 1));
+    }
+
+private:
+    u64 low{};
+    u64 high{};
+    u32 position = 0;
+};
+
+template <typename Stream>
+static bool IsOpaqueWith(std::span<const uint8_t> data) {
     // Endpoint modes with an alpha channel: LDR luminance+alpha (4, 5), RGB scale + two alpha
     // (10), LDR RGBA (12, 13) and HDR RGBA (14, 15).
     constexpr u32 AlphaModes = (1U << 4) | (1U << 5) | (1U << 10) | (1U << 12) | (1U << 13) |
                                (1U << 14) | (1U << 15);
     for (size_t offset = 0; offset + 16 <= data.size(); offset += 16) {
         const std::span<const u8> block = data.subspan(offset, 16);
-        InputBitStream strm(block);
+        Stream strm(block);
         const TexelWeightParams params = DecodeBlockInfo(strm);
         if (params.m_bError) {
             continue; // decodes to the opaque error colour
@@ -2101,6 +2141,25 @@ bool IsOpaque(std::span<const uint8_t> data) {
         }
     }
     return true;
+}
+
+bool IsOpaque(std::span<const uint8_t> data) {
+    const bool opaque = IsOpaqueWith<BlockBits>(data);
+    // EDEN_NX2_ASTC_SCAN_CHECK: also scan with the bit-by-bit reader and log differences.
+    static const bool check = std::getenv("EDEN_NX2_ASTC_SCAN_CHECK") != nullptr;
+    if (check) [[unlikely]] {
+        static std::atomic<u32> scans{};
+        static std::atomic<u32> mismatches{};
+        const bool expected = IsOpaqueWith<InputBitStream>(data);
+        if (expected != opaque) {
+            ++mismatches;
+        }
+        if (const u32 count = ++scans; count % 500 == 0 || expected != opaque) {
+            LOG_WARNING(HW_GPU, "ASTC opacity scan check: {} scans, {} differ", count,
+                        mismatches.load());
+        }
+    }
+    return opaque;
 }
 
 } // namespace Tegra::Texture::ASTC

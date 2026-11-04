@@ -8,6 +8,7 @@
 #include <chrono>
 #include <thread>
 
+#include "core/core.h"
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_storage.h"
@@ -34,6 +35,8 @@ Result IStorage::Read(
 
     R_UNLESS(length >= 0, FileSys::ResultInvalidSize);
     R_UNLESS(offset >= 0, FileSys::ResultInvalidOffset);
+    Core::g_nx2_last_read_present.store(Core::g_nx2_present_count.load(std::memory_order_relaxed),
+                                        std::memory_order_relaxed);
 
     const auto now = std::chrono::steady_clock::now();
     if (now < next_read_tick) {

@@ -4,7 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <optional>
+
 #include "common/scope_exit.h"
+#include "core/hle/kernel/svc_results.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_address_space_info.h"
@@ -2925,7 +2928,7 @@ Result KPageTableBase::MapPageGroup(KProcessAddress* out_addr, const KPageGroup&
 }
 
 Result KPageTableBase::MapPageGroup(KProcessAddress addr, const KPageGroup& pg, KMemoryState state,
-                                    KMemoryPermission perm) {
+                                    KMemoryPermission perm, bool try_lock) {
     ASSERT(!this->IsLockedByCurrentThread());
 
     // Ensure this is a valid map request.
@@ -2933,8 +2936,18 @@ Result KPageTableBase::MapPageGroup(KProcessAddress addr, const KPageGroup& pg, 
     const size_t size = num_pages * PageSize;
     R_UNLESS(this->CanContain(addr, size, state), ResultInvalidCurrentMemory);
 
-    // Lock the table.
-    KScopedLightLock lk(m_general_lock);
+    // Lock the table (try_lock: ResultBusy if it is held, see KLightLock::TryLock).
+    std::optional<KScopedLightLock> lk;
+    if (try_lock) {
+        R_UNLESS(m_general_lock.TryLock(), ResultBusy);
+    } else {
+        lk.emplace(m_general_lock);
+    }
+    SCOPE_EXIT {
+        if (try_lock) {
+            m_general_lock.Unlock();
+        }
+    };
 
     // Check if state allows us to map.
     size_t num_allocator_blocks;

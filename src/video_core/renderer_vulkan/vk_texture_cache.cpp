@@ -21,6 +21,8 @@
 #include "common/div_ceil.h"
 #include "common/settings.h"
 
+#include "common/nx2_trace.h"
+#include "video_core/background_destroyer.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -1130,6 +1132,7 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
 }
 
 void TextureCacheRuntime::Finish() {
+    Common::Nx2Trace::Scope trace{"gpu wait", "host GPU wait: texture cache finish"};
     scheduler.Finish();
 }
 
@@ -2036,20 +2039,36 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
 }
 
 void TextureCacheRuntime::TickFrame() {
+    // Freeing these (large MSAA images among them) took up to 64 ms of a frame end.
+    auto& destroyer = VideoCommon::BackgroundDestroyer::Instance();
+    std::vector<PendingTranscode> transcodes;
     while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
+        transcodes.push_back(std::move(pending_transcodes.front()));
         pending_transcodes.pop_front();
     }
+    destroyer.Destroy(std::move(transcodes));
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    std::erase_if(msaa_scratch_images, [this](MsaaScratchImage& scratch) {
-        if (!scheduler.IsFree(scratch.tick)) {
-            scratch.unused_frames = 0;
-            return false;
-        }
-        return ++scratch.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
-    });
-    std::erase_if(pending_resolve_shadows, [this](const auto& pending) {
-        return scheduler.IsFree(pending.first);
-    });
+    const auto scratch_end = std::partition(
+        msaa_scratch_images.begin(), msaa_scratch_images.end(), [this](MsaaScratchImage& scratch) {
+            if (!scheduler.IsFree(scratch.tick)) {
+                scratch.unused_frames = 0;
+                return true;
+            }
+            return ++scratch.unused_frames <= MAX_UNUSED_SCRATCH_FRAMES;
+        });
+    if (scratch_end != msaa_scratch_images.end()) {
+        destroyer.Destroy(std::vector<MsaaScratchImage>(std::make_move_iterator(scratch_end),
+                                                        std::make_move_iterator(msaa_scratch_images.end())));
+        msaa_scratch_images.erase(scratch_end, msaa_scratch_images.end());
+    }
+    const auto shadows_end =
+        std::partition(pending_resolve_shadows.begin(), pending_resolve_shadows.end(),
+                       [this](const auto& pending) { return !scheduler.IsFree(pending.first); });
+    if (shadows_end != pending_resolve_shadows.end()) {
+        destroyer.Destroy(std::vector<std::pair<u64, ResolveShadow>>(
+            std::make_move_iterator(shadows_end), std::make_move_iterator(pending_resolve_shadows.end())));
+        pending_resolve_shadows.erase(shadows_end, pending_resolve_shadows.end());
+    }
 }
 
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
@@ -2127,6 +2146,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
 Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
 
 Image::~Image() {
+    ReleaseFrontState();
+}
+
+void Image::ReleaseFrontState() {
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
         if (original_image) {
             runtime->EraseResolveShadow(*original_image);
@@ -2135,6 +2158,7 @@ Image::~Image() {
             runtime->EraseResolveShadow(*scaled_image);
         }
     }
+    runtime = nullptr;
 }
 
 void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {

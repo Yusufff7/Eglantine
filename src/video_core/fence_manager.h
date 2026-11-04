@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <algorithm>
 #include <condition_variable>
 #include <cstdlib>
@@ -92,12 +93,17 @@ public:
             return;
         }
         skipped_fences = 0;
+        // Fences that hold the GPU thread for a frame or more are stutters: log which step.
+        using Clock = std::chrono::steady_clock;
+        const auto t_start = Clock::now();
         should_flush |= query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
         TFence new_fence = CreateFence(!should_flush);
+        const auto t_created = Clock::now();
         if constexpr (can_async_check) {
             guard.lock();
         }
+        const auto t_locked = Clock::now();
         {
             std::scoped_lock lock{uncommitted_guard};
             if (delay_fence) {
@@ -108,9 +114,11 @@ public:
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
+        const auto t_queued = Clock::now();
         if (!delay_fence) {
             func();
         }
+        const auto t_called = Clock::now();
         fences.push(std::move(new_fence));
         if (should_flush) {
             rasterizer.FlushCommands();
@@ -120,6 +128,19 @@ public:
             cv.notify_all();
         }
         rasterizer.InvalidateGPUCache();
+        if (const auto t_end = Clock::now(); t_end - t_start > std::chrono::milliseconds{20}) {
+            static u32 logged{};
+            if (logged++ < 64) {
+                const auto ms = [](auto d) {
+                    return std::chrono::duration<double, std::milli>(d).count();
+                };
+                LOG_WARNING(HW_GPU,
+                            "Slow fence: {:.1f} ms (query flushes and fence {:.1f}, fence lock "
+                            "{:.1f}, queue {:.1f}, its operation {:.1f}, flush {:.1f})",
+                            ms(t_end - t_start), ms(t_created - t_start), ms(t_locked - t_created),
+                            ms(t_queued - t_locked), ms(t_called - t_queued), ms(t_end - t_called));
+            }
+        }
     }
 
     void SignalSyncPoint(u32 value) {

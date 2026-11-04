@@ -8,6 +8,7 @@
 
 #include <ranges>
 #include "common/settings.h"
+#include "common/nx2_trace.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -82,6 +83,7 @@ void MasterSemaphore::Wait(u64 tick) {
         if (gpu_tick.load(std::memory_order_acquire) >= tick) {
             return;
         }
+        Common::Nx2Trace::Scope trace{"gpu wait", "host GPU wait (any)"};
 
         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
         while (gpu_tick.load(std::memory_order_acquire) < tick) {

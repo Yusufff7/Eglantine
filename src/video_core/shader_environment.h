@@ -133,9 +133,28 @@ public:
 
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
 
+    /// Copies the registers the reads above use, so translation can run on another thread
+    /// while the GPU thread goes on (they then read only guest memory and the copy).
+    void Snapshot();
+
 private:
+    struct ConstBufferBinding {
+        GPUVAddr address;
+        u32 size;
+        bool enabled;
+    };
+    struct RegisterSnapshot {
+        std::array<ConstBufferBinding, 18> const_buffers;
+        GPUVAddr tex_header_address;
+        u32 tex_header_limit;
+        bool via_header_index;
+        u32 viewport_transform;
+        ::Common::unordered_map<u64, Tegra::Engines::Maxwell3D::HLEReplacementAttributeType> replace_table;
+    };
+
     Tegra::Engines::Maxwell3D* maxwell3d{};
     size_t stage_index{};
+    std::shared_ptr<RegisterSnapshot> snapshot;
 };
 
 class ComputeEnvironment final : public GenericEnvironment {

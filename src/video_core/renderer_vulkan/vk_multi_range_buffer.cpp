@@ -5,6 +5,7 @@
 #include <mutex>
 #include <utility>
 
+#include "common/nx2_trace.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -182,6 +183,7 @@ void MultiRangeBufferCache::RetireEntry(Scheduler& scheduler, Entry& entry) {
                 oldest = item.tick;
             }
         }
+        Common::Nx2Trace::Scope trace{"gpu wait", "host GPU wait: multi range retired full"};
         scheduler.Wait(oldest);
         DrainRetired(scheduler);
     }

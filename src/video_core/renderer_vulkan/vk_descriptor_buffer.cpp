@@ -6,6 +6,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_trace.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -103,6 +104,7 @@ DescriptorBufferRing::Allocation DescriptorBufferRing::Allocate(Scheduler& sched
     const VkDeviceSize needed{Common::AlignUp(size, alignment)};
     if (frame_reused) {
         frame_reused = false;
+        Common::Nx2Trace::Scope trace{"gpu wait", "host GPU wait: descriptor frame reused"};
         scheduler.Wait(frame_ticks[frame_index]);
     }
     if (cursor + needed > chunk_capacity) {
@@ -110,6 +112,7 @@ DescriptorBufferRing::Allocation DescriptorBufferRing::Allocate(Scheduler& sched
             ++chunk_cursor;
         } else {
             LOG_DEBUG(Render_Vulkan, "Descriptor buffer frame exhausted, stalling on the GPU");
+            Common::Nx2Trace::Scope trace{"gpu wait", "host GPU wait: descriptor frame exhausted"};
             scheduler.Finish();
             chunk_cursor = 0;
             ++generation;

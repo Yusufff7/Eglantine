@@ -340,6 +340,9 @@ public:
 
     ~Image();
 
+    /// Before destruction on another thread: releases what the runtime tracks for this image.
+    void ReleaseFrontState();
+
     Image(const Image&) = delete;
     Image& operator=(const Image&) = delete;
 

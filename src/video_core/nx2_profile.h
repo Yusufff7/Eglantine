@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <string>
@@ -51,6 +52,11 @@ enum class Zone : u32 {
     Method,       ///< Engine method calls (what a split GPU thread's back half would run)
     SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h)
     SplitWait,    ///< Split GPU thread: the back waits for work
+    CbData,       ///< Constant buffer data written (ProcessCBMultiData)
+    InlineUpload, ///< Inline uploads to memory (I2M ProcessData)
+    Sink,         ///< State writes applied from the method sink (ConsumeSink)
+    Deferred,     ///< Split GPU thread: deferred jobs run on the back
+    ComputeMethod,///< Compute engine methods (KeplerCompute::CallMethod)
     Count,
 };
 
@@ -61,7 +67,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "sync descriptors", "read handles", "fill image views", "texture buffers", "update buffers",
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
-    "fence skipped", "method", "split drain", "split wait",
+    "fence skipped", "method", "split drain", "split wait", "cb data", "inline upload",
+    "sink", "deferred", "compute method",
 };
 
 // Read once at startup: Enabled() runs several times per method write (no guard to check).
@@ -106,6 +113,14 @@ public:
         auto& data = t_data;
         const auto index = static_cast<size_t>(zone);
         data.exclusive_ns[index] += elapsed - data.child_ns;
+        // One scope holding its thread for 20 ms or more on its own: name it (stutter hunting).
+        if (elapsed - data.child_ns >= 20'000'000) [[unlikely]] {
+            static std::atomic<u32> logged{};
+            if (logged++ < 200) {
+                LOG_WARNING(HW_GPU, "Slow profile zone: {} held {:.1f} ms ({:.1f} ms with nested zones)",
+                            zone_names[index], (elapsed - data.child_ns) / 1e6, elapsed / 1e6);
+            }
+        }
         ++data.count[index];
         data.child_ns = parent_child_ns + elapsed;
     }

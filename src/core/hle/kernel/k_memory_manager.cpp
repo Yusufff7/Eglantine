@@ -8,6 +8,8 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include <optional>
+
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/device_memory.h"
@@ -301,7 +303,24 @@ Result KMemoryManager::AllocatePageGroupImpl(KPageGroup* out, size_t num_pages, 
     R_SUCCEED();
 }
 
+Result KMemoryManager::TryAllocateAndOpen(KPageGroup* out, size_t num_pages, u32 option) {
+    const auto [pool, dir] = DecodeOption(option);
+    auto& lock = m_pool_locks[static_cast<size_t>(pool)];
+    R_UNLESS(num_pages == 0 || lock.TryLock(), ResultBusy);
+    SCOPE_EXIT {
+        if (num_pages != 0) {
+            lock.Unlock();
+        }
+    };
+    R_RETURN(this->AllocateAndOpen(out, num_pages, option, true));
+}
+
 Result KMemoryManager::AllocateAndOpen(KPageGroup* out, size_t num_pages, u32 option) {
+    R_RETURN(this->AllocateAndOpen(out, num_pages, option, false));
+}
+
+Result KMemoryManager::AllocateAndOpen(KPageGroup* out, size_t num_pages, u32 option,
+                                       bool locked) {
     ASSERT(out != nullptr);
     ASSERT(out->GetNumPages() == 0);
 
@@ -310,7 +329,10 @@ Result KMemoryManager::AllocateAndOpen(KPageGroup* out, size_t num_pages, u32 op
 
     // Lock the pool that we're allocating from.
     const auto [pool, dir] = DecodeOption(option);
-    KScopedLightLock lk(m_pool_locks[static_cast<size_t>(pool)]);
+    std::optional<KScopedLightLock> lk;
+    if (!locked) {
+        lk.emplace(m_pool_locks[static_cast<size_t>(pool)]);
+    }
 
     // Allocate the page group.
     R_TRY(this->AllocatePageGroupImpl(out, num_pages, pool, dir,

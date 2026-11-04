@@ -24,6 +24,8 @@
 #include "core/hle/service/nvdrv/devices/nvhost_vic.h"
 #include "core/hle/service/nvdrv/devices/nvmap.h"
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
+#include "common/nx2_trace.h"
+#include "common/scope_exit.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nvdrv/nvmemp.h"
@@ -233,6 +235,13 @@ NvResult Module::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> input,
         return NvResult::NotImplemented;
     }
 
+    const u64 trace_begin = Common::Nx2Trace::Active() ? Common::Nx2Trace::Now() : 0;
+    SCOPE_EXIT {
+        if (trace_begin != 0 && Common::Nx2Trace::Active()) {
+            Common::Nx2Trace::Span("nvdrv", fmt::format("ioctl fd {} {:#x}", fd, command.raw),
+                                   trace_begin, Common::Nx2Trace::Now());
+        }
+    };
     return itr->second->Ioctl1(fd, command, input, output);
 }
 
@@ -250,6 +259,13 @@ NvResult Module::Ioctl2(DeviceFD fd, Ioctl command, std::span<const u8> input,
         return NvResult::NotImplemented;
     }
 
+    const u64 trace_begin = Common::Nx2Trace::Active() ? Common::Nx2Trace::Now() : 0;
+    SCOPE_EXIT {
+        if (trace_begin != 0 && Common::Nx2Trace::Active()) {
+            Common::Nx2Trace::Span("nvdrv", fmt::format("ioctl fd {} {:#x}", fd, command.raw),
+                                   trace_begin, Common::Nx2Trace::Now());
+        }
+    };
     return itr->second->Ioctl2(fd, command, input, inline_input, output);
 }
 
@@ -267,6 +283,13 @@ NvResult Module::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8> input, s
         return NvResult::NotImplemented;
     }
 
+    const u64 trace_begin = Common::Nx2Trace::Active() ? Common::Nx2Trace::Now() : 0;
+    SCOPE_EXIT {
+        if (trace_begin != 0 && Common::Nx2Trace::Active()) {
+            Common::Nx2Trace::Span("nvdrv", fmt::format("ioctl fd {} {:#x}", fd, command.raw),
+                                   trace_begin, Common::Nx2Trace::Now());
+        }
+    };
     return itr->second->Ioctl3(fd, command, input, output, inline_output);
 }
 

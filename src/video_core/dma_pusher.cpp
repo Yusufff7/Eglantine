@@ -48,10 +48,12 @@ void DmaPusher::DispatchCalls() {
         }
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        // Submits and releases fences (whose writes RecordRelease tracks): writes no memory a
+        // read must wait for by itself.
         split.Defer([gpu = &system.GPU()] {
             gpu->FlushCommands();
             gpu->OnCommandListEnd();
-        });
+        }, false);
         split.Publish();
         return;
     }
@@ -114,7 +116,7 @@ bool DmaPusher::Step() {
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {
                         engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
-                    });
+                    }, false);
                 } else {
                     engine_state->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
                 }
@@ -198,7 +200,7 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
-        VideoCommon::GpuSplit::Get().Drain();
+        VideoCommon::GpuSplit::Get().Drain(VideoCommon::GpuSplit::DrainReason::SyncMemory);
         rasterizer->SignalFence([this]() {
             std::scoped_lock lk(sync_mutex);
             synced = true;

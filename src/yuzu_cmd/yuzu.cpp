@@ -29,6 +29,10 @@
 #include <fmt/ostream.h>
 
 #include "common/logging.h"
+#include "common/stb.h"
+#include "core/frontend/framebuffer_layout.h"
+#include "core/hle/service/nvnflinger/hwc_layer.h"
+#include "video_core/renderer_base.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -303,6 +307,13 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         return SDL_APP_FAILURE;
     }
 
+#ifdef _WIN32
+    // EDEN_NX2_KEEP_DISPLAY=1 (unattended runs): keep the display on while running, as players
+    // of video do. With it asleep, presentation waits on a throttled display and the GPU idles.
+    if (const char* keep = std::getenv("EDEN_NX2_KEEP_DISPLAY"); keep != nullptr && keep[0] == '1') {
+        SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+    }
+#endif
     state->system.Initialize();
 
 
@@ -427,11 +438,103 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 // keys, by SDL scancode, that many seconds after start. Lets hidden test runs drive menus.
 double Nx2KeyClockSeconds(); // emu_window_sdl3.cpp
 
+// EDEN_NX2_SHOTS=<frame>,<frame>,... or every:<n>: saves what the game shows at those presents
+// as 480x270 PNGs (shot_<frame>.png) in EDEN_NX2_SHOT_DIR (the current directory by default),
+// to see where a scripted run is.
+static void RunScreenshots(Core::System& system) {
+    struct Shots {
+        std::vector<u64> frames;
+        u64 every{};
+        std::string dir;
+        size_t next{};
+        u64 last{};
+        std::atomic<bool> pending{};
+        std::vector<u8> pixels;
+    };
+    static Shots& shots = *[] {
+        auto* const result_ptr = new Shots;
+        Shots& result = *result_ptr;
+        const char* text = std::getenv("EDEN_NX2_SHOTS");
+        if (text == nullptr) {
+            return result_ptr;
+        }
+        const std::string list{text};
+        if (list.rfind("every:", 0) == 0) {
+            result.every = std::stoull(list.substr(6));
+        } else {
+            size_t start = 0;
+            while (start < list.size()) {
+                const size_t end = (std::min)(list.find(',', start), list.size());
+                if (end > start) {
+                    result.frames.push_back(std::stoull(list.substr(start, end - start)));
+                }
+                start = end + 1;
+            }
+            std::sort(result.frames.begin(), result.frames.end());
+        }
+        const char* dir = std::getenv("EDEN_NX2_SHOT_DIR");
+        result.dir = dir != nullptr ? dir : ".";
+        return result_ptr;
+    }();
+    if (shots.frames.empty() && shots.every == 0) {
+        return;
+    }
+    if (shots.pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    const u64 frame = Core::g_nx2_present_count.load();
+    const bool due = shots.every != 0 ? frame >= shots.last + shots.every
+                                      : shots.next < shots.frames.size() &&
+                                            frame >= shots.frames[shots.next];
+    if (!due) {
+        return;
+    }
+    if (shots.every != 0) {
+        shots.last = frame;
+    } else {
+        ++shots.next;
+    }
+    constexpr u32 width = 480;
+    constexpr u32 height = 270;
+    shots.pixels.assign(size_t{width} * height * 4, 0);
+    shots.pending.store(true, std::memory_order_release);
+    const std::string path = fmt::format("{}/shot_{:06}.png", shots.dir, frame);
+    system.Renderer().RequestScreenshot(
+        shots.pixels.data(),
+        [path](bool invert_y) {
+            auto& data = shots.pixels;
+            for (size_t i = 0; i + 3 < data.size(); i += 4) {
+                std::swap(data[i], data[i + 2]); // BGRA to RGBA
+                data[i + 3] = 0xff;
+            }
+            if (invert_y) {
+                const size_t row = size_t{width} * 4;
+                for (u32 y = 0; y < height / 2; ++y) {
+                    std::swap_ranges(data.begin() + y * row, data.begin() + (y + 1) * row,
+                                     data.begin() + (height - 1 - y) * row);
+                }
+            }
+            std::vector<u8> png;
+            stbi_write_png_to_func(
+                [](void* context, void* bytes, int size) {
+                    auto* out = static_cast<std::vector<u8>*>(context);
+                    out->insert(out->end(), static_cast<u8*>(bytes), static_cast<u8*>(bytes) + size);
+                },
+                &png, width, height, 4, data.data(), width * 4);
+            std::ofstream file{path, std::ios::binary};
+            file.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+            shots.pending.store(false, std::memory_order_release);
+        },
+        Layout::DefaultFrameLayout(width, height),
+        Service::Nvnflinger::LayerStackId::Screenshot);
+}
+
 static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
     struct KeyEvent {
         double seconds; // when frame is 0
         u64 frame;      // "f<frame>:code": after that many presents
         int code;
+        u64 idle{};     // "s<frame>:<idle>": at that frame, wait for a load to end (see below)
     };
     static const std::vector<KeyEvent> script = [] {
         std::vector<KeyEvent> events;
@@ -452,6 +555,9 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
                     const int code = std::stoi(item.substr(colon + 1));
                     if (!when.empty() && when[0] == 'f') {
                         events.push_back({0.0, std::stoull(when.substr(1)), code});
+                    } else if (!when.empty() && when[0] == 's') {
+                        events.push_back({0.0, std::stoull(when.substr(1)), 0,
+                                          static_cast<u64>((std::max)(code, 1))});
                     } else {
                         events.push_back({std::stod(when), 0, code});
                     }
@@ -462,10 +568,33 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
         return events;
     }();
     static size_t next = 0;
+    // Frames of the recording are the frames here minus `shift`: loading screens present as
+    // many frames as loading takes, which differs between runs. A sync event ("s<frame>:<idle>")
+    // waits, at its frame, until the game has read no file for <idle> frames (at most 600
+    // frames), and moves the frames after it by how much later that came than recorded.
+    static s64 shift = 0;
+    static u64 sync_started = 0;
     const double elapsed = Nx2KeyClockSeconds();
-    const u64 frame = Core::g_nx2_present_count.load();
+    const u64 present = Core::g_nx2_present_count.load();
+    const u64 frame = static_cast<u64>((std::max)(s64{0}, static_cast<s64>(present) - shift));
     while (next < script.size() && (script[next].frame != 0 ? script[next].frame <= frame
                                                             : script[next].seconds <= elapsed)) {
+        if (script[next].idle != 0) {
+            if (sync_started == 0) {
+                sync_started = present;
+            }
+            const u64 last_read = Core::g_nx2_last_read_present.load();
+            const bool idle = present >= last_read + script[next].idle;
+            if (!idle && present < sync_started + 600) {
+                return; // still loading: hold the rest of the script
+            }
+            shift += static_cast<s64>(present - sync_started);
+            LOG_INFO(Frontend, "Key script: sync at recorded frame {} waited {} frames ({}), shift {}",
+                     script[next].frame, present - sync_started, idle ? "idle" : "timed out", shift);
+            sync_started = 0;
+            ++next;
+            continue;
+        }
         const int code = script[next].code;
         LOG_INFO(Frontend, "Key script: {} key {} at {:.1f} s (frame {})",
                  code < 0 ? "release" : "press", code < 0 ? -code : code, elapsed, frame);
@@ -481,6 +610,7 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
     RunKeyScript(state->input_subsystem);
+    RunScreenshots(state->system);
     return state->emu_window && state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;
 }
 extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {

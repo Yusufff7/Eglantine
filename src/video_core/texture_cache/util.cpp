@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
+#include <thread>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -24,6 +26,7 @@
 #include "common/div_ceil.h"
 #include "common/scratch_buffer.h"
 #include "common/settings.h"
+#include "common/thread_worker.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/guest_memory.h"
@@ -605,7 +608,28 @@ u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept {
 }
 
 bool AstcDataLooksOpaque(std::span<const u8> data) noexcept {
-    return Tegra::Texture::ASTC::IsOpaque(data);
+    // A large opaque texture has every block's modes read (no alpha block ends it early): 60 ms of
+    // a 170 ms stutter as title 1's race begins. Larger ones are split over workers.
+    constexpr size_t ParallelBytes = 1ULL << 20;
+    if (data.size() < ParallelBytes) {
+        return Tegra::Texture::ASTC::IsOpaque(data);
+    }
+    static Common::ThreadWorker workers(
+        (std::max)(2u, (std::min)(8u, std::thread::hardware_concurrency() / 4)), "AstcScan");
+    constexpr size_t Parts = 8;
+    const size_t blocks = data.size() / 16;
+    const size_t part_bytes = Common::DivCeil(blocks, Parts) * 16;
+    std::atomic<bool> alpha{false};
+    for (size_t offset = 0; offset < blocks * 16; offset += part_bytes) {
+        const auto part = data.subspan(offset, (std::min)(part_bytes, blocks * 16 - offset));
+        workers.QueueWork([part, &alpha] {
+            if (!alpha.load(std::memory_order_relaxed) && !Tegra::Texture::ASTC::IsOpaque(part)) {
+                alpha.store(true, std::memory_order_relaxed);
+            }
+        });
+    }
+    workers.WaitForRequests();
+    return !alpha.load(std::memory_order_relaxed);
 }
 
 u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept {

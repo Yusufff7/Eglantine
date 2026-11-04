@@ -60,6 +60,18 @@ public:
 
     KPhysicalAddress AllocateAndOpenContinuous(size_t num_pages, size_t align_pages, u32 option);
     Result AllocateAndOpen(KPageGroup* out, size_t num_pages, u32 option);
+
+    /// The thread holding `pool`'s lock (debugging), or null.
+    KThread* GetPoolLockOwner(Pool pool) const {
+        return m_pool_locks[static_cast<size_t>(pool)].GetOwner();
+    }
+    /// AllocateAndOpen, or ResultBusy if the pool's lock is held (see KLightLock::TryLock).
+    Result TryAllocateAndOpen(KPageGroup* out, size_t num_pages, u32 option);
+
+private:
+    Result AllocateAndOpen(KPageGroup* out, size_t num_pages, u32 option, bool locked);
+
+public:
     Result AllocateForProcess(KPageGroup* out, size_t num_pages, u32 option, u64 process_id,
                               u8 fill_pattern);
 

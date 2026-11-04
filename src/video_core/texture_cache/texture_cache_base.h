@@ -34,6 +34,7 @@
 #include "common/thread_worker.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/control/channel_state_cache.h"
+#include "video_core/background_destroyer.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/surface.h"
@@ -138,7 +139,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 budget_check_frames{};
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
-    std::vector<u8> astc_scan_buffer;
+    Common::ScratchBuffer<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
 
@@ -194,6 +195,11 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 public:
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
 
+    /// Memory queries running on the BackgroundDestroyer write into this.
+    ~TextureCache() {
+        BackgroundDestroyer::Instance().Wait();
+    }
+
     /// Notify the cache that a new frame has been queued
     void TickFrame();
 
@@ -244,6 +250,15 @@ public:
 
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
+
+    /// WriteMemory, returning whether any image overlaps the region.
+    bool WriteMemoryFound(DAddr cpu_addr, size_t size);
+
+    /// Moves whenever an image is registered: a region WriteMemory found no image in stays
+    /// without one while it does not.
+    [[nodiscard]] u64 RegistrationGeneration() const noexcept {
+        return registration_generation;
+    }
 
     /// Download contents of host images to guest memory in a region
     void DownloadMemory(DAddr cpu_addr, size_t size);
@@ -517,6 +532,7 @@ private:
     using PendingDownload = PendingImageDownload<Image>;
 
     Common::SlotVector<Image> slot_images;
+    u64 registration_generation{}; ///< RegisterImage calls (see RegistrationGeneration)
     Common::SlotVector<ImageMapView> slot_map_views;
     Common::SlotVector<ImageView> slot_image_views;
     Common::SlotVector<ImageAlloc> slot_image_allocs;
@@ -543,6 +559,11 @@ private:
  #else
     static constexpr size_t TICKS_TO_DESTROY = 8;
 #endif
+    u64 memory_query_frames{};
+    std::atomic<u64> queried_memory{};
+    std::atomic<u64> queried_budget{};
+    std::atomic<bool> memory_query_done{};
+    std::atomic<bool> memory_query_pending{};
     DelayedDestructionRing<Image, TICKS_TO_DESTROY> sentenced_images;
     DelayedDestructionRing<ImageView, TICKS_TO_DESTROY> sentenced_image_view;
     DelayedDestructionRing<Framebuffer, TICKS_TO_DESTROY> sentenced_framebuffers;

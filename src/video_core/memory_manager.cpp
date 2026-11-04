@@ -17,6 +17,7 @@
 #include "video_core/nx2.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
+#include "common/nx2_trace.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
@@ -783,6 +784,7 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
 }
 
 void MemoryManager::FlushCaching() {
+    Common::Nx2Trace::Scope trace{"memory", "flush caching"};
     // Flush from the invalidate accumulator
     if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
         GetSubmappedRangeImpl<false>(addr, size, page_stash2);

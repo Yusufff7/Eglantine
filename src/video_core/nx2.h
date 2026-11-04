@@ -239,7 +239,13 @@ public:
     }
 
     /// A GPU write of `value` to the u32 at `device_address`.
-    void OnWrite(u64 device_address, u32 value) {
+    /// `writer` (debugging, EDEN_NX2_WAIT_STATS): 1 QMD add release, 2 QMD max release,
+    /// 3 query cache fence, 4 query cache immediate write.
+    void OnWrite(u64 device_address, u32 value, u32 writer = 0) {
+        if (writer != 0 && TrackWriters()) [[unlikely]] {
+            std::scoped_lock lk{writers_mutex};
+            writers[device_address] = writer;
+        }
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -251,7 +257,18 @@ public:
         }
     }
 
+    /// Debugging: what last wrote the word at `device_address` (see OnWrite), 0 if unknown.
+    u32 LastWriter(u64 device_address) {
+        std::scoped_lock lk{writers_mutex};
+        const auto it = writers.find(device_address);
+        return it != writers.end() ? it->second : 0;
+    }
+    static bool TrackWriters();
+
 private:
+    std::mutex writers_mutex;
+    std::map<u64, u32> writers;
+
     struct Waiter {
         const void* owner;
         u64 address;

@@ -3166,6 +3166,7 @@ public:
 
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
+    void CallMethodPairs(Core::System& system, const u64* pairs, u32 count) override;
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
@@ -3345,6 +3346,9 @@ private:
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
+    void FrontRecordRelease(VideoCommon::GpuSplit& split, const FrontState& state);
+    /// Back: reads what a speculative MME DMA read read on the front, where it was sent.
+    void CheckDmaRead(GPUVAddr source, u32 bytes, u64 hash);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

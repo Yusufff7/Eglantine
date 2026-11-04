@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -204,6 +205,54 @@ void SwizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_p
     bytes_per_pixel = 1U << new_bpp;
     Swizzle<true>(output, input, bytes_per_pixel, width, height, depth, block_height, block_depth,
                   stride, native_tiling);
+}
+
+void CopySwizzledSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
+                         u32 width, u32 height, u32 origin_x, u32 origin_y, u32 extent_x,
+                         u32 extent_y, u32 block_height, bool native_tiling) {
+    // Same shape: a pixel is at the same offset in both surfaces (GOB layout included).
+    const u32 stride = Common::AlignUpLog2(width * bytes_per_pixel, GOB_SIZE_X_SHIFT);
+    const u32 gobs_in_x = Common::DivCeilLog2(stride, GOB_SIZE_X_SHIFT);
+    const u32 block_size = gobs_in_x << (GOB_SIZE_SHIFT + block_height);
+    const u32 block_height_mask = (1U << block_height) - 1;
+    const u32 x_shift = GOB_SIZE_SHIFT + block_height;
+    const size_t limit = (std::min)(output.size(), input.size());
+
+    const u32 x0 = origin_x * bytes_per_pixel;
+    const u32 x1 = (origin_x + extent_x) * bytes_per_pixel;
+    const u32 y0 = origin_y;
+    const u32 y1 = (std::min)(origin_y + extent_y, height);
+    if (x1 <= x0 || y1 <= y0) {
+        return;
+    }
+    for (u32 gob_y = y0 >> GOB_SIZE_Y_SHIFT; gob_y <= (y1 - 1) >> GOB_SIZE_Y_SHIFT; ++gob_y) {
+        const u32 offset_y = (gob_y >> block_height) * block_size +
+                             ((gob_y & block_height_mask) << GOB_SIZE_SHIFT);
+        const u32 rows_begin = (std::max)(y0, gob_y << GOB_SIZE_Y_SHIFT);
+        const u32 rows_end = (std::min)(y1, (gob_y + 1) << GOB_SIZE_Y_SHIFT);
+        const bool all_rows = rows_end - rows_begin == GOB_SIZE_Y;
+        for (u32 gob_x = x0 >> GOB_SIZE_X_SHIFT; gob_x <= (x1 - 1) >> GOB_SIZE_X_SHIFT; ++gob_x) {
+            const size_t gob = offset_y + (gob_x << x_shift);
+            const u32 columns_begin = (std::max)(x0, gob_x << GOB_SIZE_X_SHIFT);
+            const u32 columns_end = (std::min)(x1, (gob_x + 1) << GOB_SIZE_X_SHIFT);
+            if (all_rows && columns_end - columns_begin == GOB_SIZE_X) {
+                if (gob + GOB_SIZE <= limit) {
+                    std::memcpy(&output[gob], &input[gob], GOB_SIZE);
+                }
+                continue;
+            }
+            for (u32 y = rows_begin; y < rows_end; ++y) {
+                const u32 swizzled_y = pdep<SWIZZLE_Y_BITS>(y);
+                for (u32 x = columns_begin; x < columns_end; x += bytes_per_pixel) {
+                    const size_t offset = NativeGobOffset(
+                        static_cast<u32>(gob) + (pdep<SWIZZLE_X_BITS>(x) | swizzled_y), native_tiling);
+                    if (offset + bytes_per_pixel <= limit) {
+                        std::memcpy(&output[offset], &input[offset], bytes_per_pixel);
+                    }
+                }
+            }
+        }
+    }
 }
 
 void SwizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,

@@ -2,8 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <map>
+#include <string>
 #include <cstdlib>
 #include <thread>
+#include <typeinfo>
+#include <utility>
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -21,9 +27,11 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
+#include "common/nx2_trace.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sampler.h"
 
 namespace VideoCommon {
 
@@ -113,6 +121,13 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
+    Nx2Sampler::Start(back_thread.native_handle(), "back");
+    stall_thread = std::jthread([this](std::stop_token stop_token) { StallWatch(stop_token); });
+    front_engine = nullptr;
+    batch_engine = nullptr;
+    batch_size = 0;
+    run_engine = nullptr;
+    run_size = 0;
     active = true;
 #ifdef ARCHITECTURE_x86_64
     // Front macros run compiled (macro_turing_jit.h) only.
@@ -126,6 +141,10 @@ void GpuSplit::MaybeStart(Core::System& system_) {
 void GpuSplit::Stop() {
     if (!back_thread.joinable()) {
         return;
+    }
+    if (stall_thread.joinable()) {
+        stall_thread.request_stop();
+        stall_thread.join();
     }
     back_thread.request_stop();
     wake.fetch_add(1, std::memory_order_seq_cst);
@@ -182,7 +201,35 @@ void GpuSplit::WaitForSpace(size_t words) {
     }
 }
 
+void GpuSplit::FlushState() {
+    const size_t count = batch_size;
+    batch_size = 0;
+    // Named every time: cheap next to the batch, and the back never applies one to an engine
+    // an earlier entry left selected.
+    SwitchEngine(batch_engine);
+    u64* const entry = Reserve(1 + count);
+    entry[0] = static_cast<u64>(Kind::State) | (u64{count} << 8);
+    std::memcpy(entry + 1, batch.data(), count * sizeof(u64));
+    Commit(1 + count);
+}
+
+void GpuSplit::FlushRun() {
+    const size_t count = run_size;
+    run_size = 0;
+    SwitchEngine(run_engine);
+    u64* const entry = Reserve(1 + count);
+    entry[0] = static_cast<u64>(Kind::Run) | (u64{count} << 8);
+    std::memcpy(entry + 1, run.data(), count * sizeof(u64));
+    Commit(1 + count);
+}
+
 void GpuSplit::Publish() {
+    if (batch_size != 0) {
+        FlushState();
+    }
+    if (run_size != 0) {
+        FlushRun();
+    }
     if (published_local == write_position) {
         return;
     }
@@ -195,17 +242,94 @@ void GpuSplit::Publish() {
     }
 }
 
-void GpuSplit::Drain() {
+namespace {
+
+struct DrainStats {
+    std::array<u64, static_cast<size_t>(GpuSplit::DrainReason::Count)> calls{};
+    std::array<u64, static_cast<size_t>(GpuSplit::DrainReason::Count)> waits{};
+    std::array<u64, static_cast<size_t>(GpuSplit::DrainReason::Count)> wait_ns{};
+    std::chrono::steady_clock::time_point window_start = std::chrono::steady_clock::now();
+};
+
+bool DrainStatsEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_DRAIN_STATS") != nullptr;
+    return enabled;
+}
+
+// Front thread only: logs every 5 s how often each reason waited and for how long.
+void RecordDrain(GpuSplit::DrainReason reason, bool waited, u64 ns) {
+    static DrainStats stats;
+    const auto index = static_cast<size_t>(reason);
+    ++stats.calls[index];
+    stats.waits[index] += waited ? 1 : 0;
+    stats.wait_ns[index] += ns;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - stats.window_start < std::chrono::seconds{5}) {
+        return;
+    }
+    static constexpr std::array names{"other", "acquire", "acquire full", "acquire queued", "acquire met", "acquire resume", "puller", "dma read",
+                                      "dma read full", "sync memory", "front init"};
+    std::string line;
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (stats.calls[i] != 0) {
+            line += fmt::format(" | {} {}/s waited {}/s {:.1f} ms/s", names[i], stats.calls[i] / 5,
+                                stats.waits[i] / 5, stats.wait_ns[i] / 5e6);
+        }
+    }
+    LOG_INFO(HW_GPU, "Drains per second:{}", line);
+    stats = {};
+    stats.window_start = now;
+}
+
+} // Anonymous namespace
+
+void GpuSplit::Drain(DrainReason reason) {
+    if (batch_size != 0) {
+        FlushState();
+    }
+    if (run_size != 0) {
+        FlushRun();
+    }
     consumed_cache = consumed.load(std::memory_order_acquire);
+    static constexpr std::array trace_names{
+        "drain: other",       "drain: acquire",    "drain: acquire full", "drain: acquire queued",
+        "drain: acquire met", "drain: acquire resume", "drain: puller",   "drain: dma read",
+        "drain: dma read full", "drain: sync memory", "drain: front init"};
+    Common::Nx2Trace::Scope trace{
+        "split", consumed_cache == write_position
+                     ? "drain (idle)"
+                     : trace_names[std::min<size_t>(static_cast<size_t>(reason),
+                                                    trace_names.size() - 1)]};
     if (consumed_cache == write_position) {
+        if (DrainStatsEnabled()) {
+            RecordDrain(reason, false, 0);
+        }
         return;
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const auto start = DrainStatsEnabled() ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+    const auto drain_start = std::chrono::steady_clock::now();
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
+            if (DrainStatsEnabled()) {
+                RecordDrain(reason, true,
+                            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now() - start)
+                                                 .count()));
+            }
+            if (const auto took = std::chrono::steady_clock::now() - drain_start;
+                took > std::chrono::milliseconds{30}) [[unlikely]] {
+                static u32 reported{};
+                if (reported++ < 200) {
+                    LOG_WARNING(HW_GPU, "GPU front waited {} ms for the back (drain reason {})",
+                                std::chrono::duration_cast<std::chrono::milliseconds>(took).count(),
+                                static_cast<u32>(reason));
+                }
+            }
             return;
         }
         if (spins < 16384) {
@@ -216,9 +340,111 @@ void GpuSplit::Drain() {
     }
 }
 
+void GpuSplit::DrainTo(u64 position, DrainReason reason) {
+    if (position >= write_position) {
+        return Drain(reason);
+    }
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    if (consumed_cache >= position) {
+        if (DrainStatsEnabled()) {
+            RecordDrain(reason, false, 0);
+        }
+        return;
+    }
+    if (published_local < position) {
+        Publish();
+    }
+    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const auto start = DrainStatsEnabled() ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+    for (u32 spins = 0;; ++spins) {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        if (consumed_cache >= position) {
+            if (DrainStatsEnabled()) {
+                RecordDrain(reason, true,
+                            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now() - start)
+                                                 .count()));
+            }
+            return;
+        }
+        if (spins < 16384) {
+            Pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
+} // namespace VideoCommon
+
+bool Tegra::Nx2SemaphoreWaiters::TrackWriters() {
+    return VideoCommon::GpuSplit::WaitStatsEnabled();
+}
+
+namespace VideoCommon {
+
+bool GpuSplit::WaitStatsEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_WAIT_STATS") != nullptr;
+    return enabled;
+}
+
+void GpuSplit::NoteWait(const char* what, u32 tag, u64 position) {
+    struct Counts {
+        u64 count;
+        u64 from_end;
+        u64 ahead_of_back;
+    };
+    static std::map<std::pair<std::string, u32>, Counts> counts;
+    static auto window = std::chrono::steady_clock::now();
+    const u64 back = consumed.load(std::memory_order_acquire);
+    auto& entry = counts[{what, tag}];
+    ++entry.count;
+    entry.from_end += write_position - std::min(position, write_position);
+    entry.ahead_of_back += position > back ? position - back : 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds{5}) {
+        return;
+    }
+    std::string line;
+    for (const auto& [key, value] : counts) {
+        line += fmt::format(" | {} {:#x}: {}/s, {} words before the end, {} past the back", key.first,
+                            key.second, value.count / 5, value.from_end / value.count,
+                            value.ahead_of_back / value.count);
+    }
+    LOG_INFO(HW_GPU, "Waits:{}", line);
+    counts.clear();
+    window = now;
+}
+
+void GpuSplit::NoteSkipped(DrainReason reason) {
+    if (DrainStatsEnabled()) {
+        RecordDrain(reason, false, 0);
+    }
+}
+
+void GpuSplit::SetUnorderedEngine(Tegra::Engines::EngineInterface* engine, bool unordered) {
+    const auto end = unordered_engines.end();
+    const auto it = std::find(unordered_engines.begin(), end, engine);
+    if (unordered && it == end) {
+        if (const auto slot = std::find(unordered_engines.begin(), end, nullptr); slot != end) {
+            *slot = engine;
+        }
+    } else if (!unordered && it != end) {
+        *it = nullptr;
+    }
+    if (engine == front_engine) {
+        front_engine_unordered = unordered && std::find(unordered_engines.begin(), end, engine) != end;
+    }
+}
+
 void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
-    front_engine = engine;
+    // Reserve first: it may flush pending writes, which select their engine.
     u64* const entry = Reserve(2);
+    front_engine = engine;
+    front_engine_unordered =
+        engine != nullptr &&
+        std::find(unordered_engines.begin(), unordered_engines.end(), engine) != unordered_engines.end();
     entry[0] = static_cast<u64>(Kind::Engine);
     entry[1] = reinterpret_cast<u64>(engine);
     Commit(2);
@@ -247,6 +473,7 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         amount -= piece;
         methods_pending -= piece;
     }
+    MarkIfOrdered();
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
@@ -255,6 +482,59 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
         (*heap)();
         delete heap;
     });
+}
+
+void GpuSplit::StallWatch(std::stop_token stop_token) {
+    // Any one entry that holds the back for 30 ms or more is a stutter: say which, and for how
+    // long once it is done. The back only stores its position per entry for this.
+    Common::SetCurrentThreadName("GPUStallWatch");
+    u64 watched = ~u64{};
+    u32 ticks = 0;
+    while (!stop_token.stop_requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        const u64 position = executing.load(std::memory_order_relaxed);
+        if (position != ~u64{} && position == watched) {
+            if (++ticks == 6) {
+                ReportStall(&ring[position & RingMask], 30'000'000);
+            }
+            continue;
+        }
+        if (ticks >= 6) {
+            LOG_WARNING(HW_GPU, "GPU back stall ended after about {} ms", ticks * 5);
+        }
+        watched = position;
+        ticks = 0;
+    }
+}
+
+void GpuSplit::ReportStall(const u64* entry, u64 took_ns) {
+    static u32 reported{};
+    if (reported++ >= 200) {
+        return;
+    }
+    const u64 head = entry[0];
+    const auto kind = static_cast<Kind>(head & 0xf);
+    static constexpr std::array kind_names{"wrap", "engine", "method", "multi", "call", "state", "run"};
+    // Read once: the back may change it meanwhile (the watchdog runs beside it).
+    const Tegra::Engines::EngineInterface* const engine = back_engine;
+    const char* engine_name = "no engine";
+    if (engine != nullptr) {
+        try {
+            engine_name = typeid(*engine).name();
+        } catch (...) {
+            engine_name = "engine";
+        }
+    }
+    const u64 detail = (head >> 8) & 0xffff;
+    if (kind == Kind::Call) {
+        LOG_WARNING(HW_GPU, "GPU back stall: over {} ms in a deferred job: {}", took_ns / 1'000'000,
+                    reinterpret_cast<const char*>(entry[2]));
+        return;
+    }
+    LOG_WARNING(HW_GPU, "GPU back stall: over {} ms in a {} entry ({} {:#x})", took_ns / 1'000'000,
+                static_cast<size_t>(kind) < kind_names.size() ? kind_names[static_cast<size_t>(kind)]
+                                                             : "?",
+                engine_name, detail);
 }
 
 size_t GpuSplit::Execute(const u64* entry) {
@@ -269,14 +549,16 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
-        if ((head & Direct) != 0) {
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        // State writes wait in the method sink for the next method with side effects, macro
+        // writes too where the engine allows (sink_direct_state): most writes a frame are
+        // macro state writes, and CallMethod for each was a large part of the back thread.
+        const bool state = !engine->execution_mask[method];
+        if ((head & Direct) != 0 && !(state && engine->sink_direct_state)) {
             engine->ConsumeSink(*system);
             engine->CallMethod(*system, method, argument, true);
-        } else if (!engine->execution_mask[method]) {
+        } else if (state) {
             engine->method_sink.emplace_back(method, argument);
         } else {
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
             if ((head & HasSegment) != 0) {
                 engine->current_dma_segment = entry[1];
@@ -290,7 +572,6 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
-        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         if ((head & HasSegment) != 0) {
             engine->current_dma_segment = entry[2];
@@ -299,10 +580,33 @@ size_t GpuSplit::Execute(const u64* entry) {
                                 amount, static_cast<u32>(entry[1]));
         return data + (amount + 1) / 2;
     }
+    case Kind::State: {
+        const size_t count = static_cast<size_t>((head >> 8) & 0xffffff);
+        if (back_engine == nullptr) [[unlikely]] {
+            static bool logged{};
+            if (!std::exchange(logged, true)) {
+                LOG_ERROR(HW_GPU, "GPU split: state writes without an engine, dropped");
+            }
+            return 1 + count;
+        }
+        auto& sink = back_engine->method_sink;
+        for (size_t i = 1; i <= count; ++i) {
+            sink.emplace_back(static_cast<u32>(entry[i] & 0xffff), static_cast<u32>(entry[i] >> 32));
+        }
+        return 1 + count;
+    }
+    case Kind::Run: {
+        const size_t count = static_cast<size_t>((head >> 8) & 0xffffff);
+        auto* const engine = back_engine;
+        engine->ConsumeSink(*system);
+        engine->CallMethodPairs(*system, entry + 1, static_cast<u32>(count));
+        return 1 + count;
+    }
     case Kind::Call: {
+        Nx2Profile::Scope deferred_scope{Nx2Profile::Zone::Deferred};
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
-        reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
-        return 2 + payload;
+        reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 3);
+        return 3 + payload;
     }
     }
     return 1;
@@ -312,6 +616,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     Common::SetCurrentThreadName("GPUBack");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
+    Common::PinCurrentThreadToDedicatedCore(0);
     system->RegisterHostThread();
 #ifdef _WIN32
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
@@ -334,6 +639,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 const u32 seen = wake.load(std::memory_order_seq_cst);
                 available = published.load(std::memory_order_seq_cst);
                 if (available == read_position && !stop_token.stop_requested()) {
+                    Common::Nx2Trace::Scope trace{"split", "back idle"};
                     wake.wait(seen, std::memory_order_seq_cst);
                 }
                 back_waiting.store(false, std::memory_order_relaxed);
@@ -342,16 +648,19 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         }
         u64 last_store = read_position;
         g_back_busy.store(true, std::memory_order_relaxed);
+        Common::Nx2Trace::Scope trace{"split", "back runs"};
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            executing.store(read_position, std::memory_order_relaxed); // For StallWatch
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
             // Hand ring space back now and then while working through a long batch.
-            if (read_position - last_store >= 4096 && read_position != available) {
+            if (read_position - last_store >= 1024 && read_position != available) {
                 consumed.store(read_position, std::memory_order_release);
                 last_store = read_position;
             }
         }
+        executing.store(~u64{}, std::memory_order_relaxed);
         g_back_busy.store(false, std::memory_order_release);
         consumed.store(read_position, std::memory_order_release);
     }

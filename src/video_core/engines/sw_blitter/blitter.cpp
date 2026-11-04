@@ -1,12 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <bit>
+#include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <thread>
 #include <vector>
 
+#include "common/alignment.h"
+#include "common/scope_exit.h"
+#include "common/div_ceil.h"
 #include "common/scratch_buffer.h"
+#include "common/thread_worker.h"
 #include "video_core/engines/sw_blitter/blitter.h"
+#include "video_core/nx2.h"
 #include "video_core/engines/sw_blitter/converter.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
@@ -129,6 +138,8 @@ void ProcessPitchLinear(std::span<const u8> input, std::span<u8> output, size_t 
 
 struct SoftwareBlitEngine::BlitEngineImpl {
     Common::ScratchBuffer<u8> tmp_buffer;
+    Common::ScratchBuffer<u8> dst_tmp_buffer; ///< The destination while the source is in use
+
     Common::ScratchBuffer<u8> src_buffer;
     Common::ScratchBuffer<u8> dst_buffer;
     Common::ScratchBuffer<f32> intermediate_src;
@@ -162,8 +173,90 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
     const auto dst_bytes_per_pixel = BytesPerBlock(PixelFormatFromRenderTargetFormat(dst.format));
     const size_t src_size = get_surface_size(src, src_bytes_per_pixel);
 
+    // Slow blits (a frame or more) are stutters: log where the time went.
+    const auto blit_start = std::chrono::steady_clock::now();
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::SafeRead> tmp_buffer(
         memory_manager, src.Address(), src_size, &impl->tmp_buffer);
+    const auto read_done = std::chrono::steady_clock::now();
+    auto converted = read_done;
+    auto unswizzled = read_done;
+    std::chrono::steady_clock::duration swizzling{};
+    std::chrono::steady_clock::duration mapping{};
+    u32 read_rows = 0;
+    const char* path = "general";
+    SCOPE_EXIT {
+        const auto end = std::chrono::steady_clock::now();
+        if (end - blit_start > std::chrono::milliseconds{20}) {
+            static u32 logged{};
+            if (logged++ < 64) {
+                const auto ms = [](auto d) {
+                    return std::chrono::duration<double, std::milli>(d).count();
+                };
+                LOG_WARNING(HW_GPU,
+                            "Slow software 2D blit ({}): {:.1f} ms ({:.1f} reading the source, {:.1f} "
+                            "unswizzling, {:.1f} converting and writing ({:.1f} swizzling, {:.1f} mapping, {} rows read), {:.1f} writing back): src {}x{} bh {} origin {},{} dst {}x{} bh {} origin {},{}; {}x{} "
+                            "format {:#x} {} at {:#x} -> {}x{} format {:#x} {} at {:#x}, {} bytes read",
+                            path, ms(end - blit_start), ms(read_done - blit_start),
+                            ms(unswizzled - read_done), ms(converted - unswizzled), ms(swizzling), ms(mapping), read_rows, ms(end - converted), src.width, src.height, static_cast<u32>(src.block_height),
+                            config.src_x0, config.src_y0, dst.width, dst.height,
+                            static_cast<u32>(dst.block_height), config.dst_x0, config.dst_y0, src_extent_x,
+                            src_extent_y, static_cast<u32>(src.format),
+                            src.linear == Fermi2D::MemoryLayout::BlockLinear ? "block" : "pitch",
+                            src.Address(), dst_extent_x, dst_extent_y,
+                            static_cast<u32>(dst.format),
+                            dst.linear == Fermi2D::MemoryLayout::BlockLinear ? "block" : "pitch",
+                            dst.Address(), src_size);
+            }
+        }
+    };
+
+    // A copy of a whole surface into one of the same size, format and layout moves the same
+    // bytes: write them over at once instead of unswizzling and swizzling every pixel (16 MiB
+    // RGBA32F textures took 20-90 ms that way, a stutter each).
+    const bool same_layout =
+        src.format == dst.format && src.linear == dst.linear && src.width == dst.width &&
+        src.height == dst.height && src.depth == dst.depth &&
+        (src.linear == Fermi2D::MemoryLayout::BlockLinear
+             ? src.block_height == dst.block_height && src.block_depth == dst.block_depth
+             : src.pitch == dst.pitch);
+    const bool whole_surface = config.src_x0 == 0 && config.src_y0 == 0 && config.dst_x0 == 0 &&
+                               config.dst_y0 == 0 && src_extent_x == src.width &&
+                               src_extent_y == src.height && dst_extent_x == src_extent_x &&
+                               dst_extent_y == src_extent_y;
+    if (same_layout && whole_surface && src_size == get_surface_size(dst, dst_bytes_per_pixel)) {
+        const auto back_start = std::chrono::steady_clock::now();
+        Tegra::Nx2BackSparseWrite(dst.Address(), src_size);
+        const auto write_start = std::chrono::steady_clock::now();
+        memory_manager.WriteBlock(dst.Address(), tmp_buffer.data(), src_size);
+        const auto write_end = std::chrono::steady_clock::now();
+        if (write_end - back_start > std::chrono::milliseconds{20}) {
+            static u32 logged{};
+            if (logged++ < 32) {
+                LOG_WARNING(HW_GPU, "Whole-surface 2D copy of {} bytes: {:.1f} ms backing, {:.1f} ms writing",
+                            src_size,
+                            std::chrono::duration<double, std::milli>(write_start - back_start).count(),
+                            std::chrono::duration<double, std::milli>(write_end - write_start).count());
+            }
+        }
+        return true;
+    }
+
+    // The same rectangle of two tiled surfaces of one shape (title 1: 1023x1023 of 1024x1024
+    // RGBA32F, 20-50 ms each through the linear buffers): copy it in place, GOB by GOB.
+    const bool same_rect = config.src_x0 == config.dst_x0 && config.src_y0 == config.dst_y0 &&
+                           src_extent_x == dst_extent_x && src_extent_y == dst_extent_y;
+    if (same_layout && same_rect && src.linear == Fermi2D::MemoryLayout::BlockLinear &&
+        src.depth == 1 && std::has_single_bit(src_bytes_per_pixel) && src_bytes_per_pixel <= 16 &&
+        src_size == get_surface_size(dst, dst_bytes_per_pixel)) {
+        Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::SafeReadWrite>
+            dst_memory(memory_manager, dst.Address(), src_size, &impl->dst_tmp_buffer);
+        CopySwizzledSubrect(dst_memory, tmp_buffer, src_bytes_per_pixel, src.width, src.height,
+                            config.src_x0, config.src_y0, src_extent_x, src_extent_y,
+                            src.block_height);
+        path = "in place";
+        converted = std::chrono::steady_clock::now();
+        return true;
+    }
 
     const size_t src_copy_size = src_extent_x * src_extent_y * src_bytes_per_pixel;
     const size_t dst_copy_size = dst_extent_x * dst_extent_y * dst_bytes_per_pixel;
@@ -201,7 +294,27 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
     // Do actual Blit
 
     impl->dst_buffer.resize_destructive(dst_copy_size);
-    if (src.linear == Fermi2D::MemoryLayout::BlockLinear) {
+    if (src.linear == Fermi2D::MemoryLayout::BlockLinear && src.depth == 1 &&
+        src_copy_size >= (4u << 20)) {
+        // Large ones (16-64 MiB RGBA32F, 5-30 ms on one core) in bands of rows on the workers.
+        static Common::ThreadWorker workers((std::max)(2u, (std::min)(8u, std::thread::hardware_concurrency() / 4)),
+                                            "BlitUnswizzle");
+        const u32 pitch = src_extent_x * src_bytes_per_pixel;
+        const u32 bands = 8;
+        const u32 band_rows = Common::DivCeil(src_extent_y, bands);
+        const std::span<u8> output = impl->src_buffer;
+        const std::span<const u8> input = tmp_buffer;
+        for (u32 first = 0; first < src_extent_y && config.src_y0 + first < src.height;
+             first += band_rows) {
+            const u32 rows = (std::min)(band_rows, src_extent_y - first);
+            workers.QueueWork([=, &src, &config] {
+                UnswizzleSubrect(output.subspan(size_t{first} * pitch), input, src_bytes_per_pixel,
+                                 src.width, src.height, 1, config.src_x0, config.src_y0 + first,
+                                 src_extent_x, rows, src.block_height, src.block_depth, pitch);
+            });
+        }
+        workers.WaitForRequests();
+    } else if (src.linear == Fermi2D::MemoryLayout::BlockLinear) {
         UnswizzleSubrect(impl->src_buffer, tmp_buffer, src_bytes_per_pixel, src.width, src.height,
                          src.depth, config.src_x0, config.src_y0, src_extent_x, src_extent_y,
                          src.block_height, src.block_depth, src_extent_x * src_bytes_per_pixel);
@@ -210,6 +323,7 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
                                   src.pitch, config.src_x0, config.src_y0, src_bytes_per_pixel);
     }
 
+    unswizzled = std::chrono::steady_clock::now();
     // Conversion Phase
     if (no_passthrough) {
         if (src.format != dst.format || config.filter == Fermi2D::Filter::Bilinear) {
@@ -219,6 +333,91 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
         }
     } else {
         impl->dst_buffer.swap(impl->src_buffer);
+    }
+
+    // Into a 2D tiled surface: write only the block rows and GOB columns the rectangle covers,
+    // without reading back the ones it covers whole. The whole destination was read and written
+    // (title 1: 1024x1024 RGBA32F into the corner of 2048x2048, 64 MiB each way, 40-75 ms).
+    if (dst.linear == Fermi2D::MemoryLayout::BlockLinear && dst.depth == 1 &&
+        std::has_single_bit(dst_bytes_per_pixel) && dst_bytes_per_pixel <= 16 &&
+        dst_extent_x > 0 && dst_extent_y > 0 && config.dst_y0 < dst.height) {
+        const u32 block_height = dst.block_height;
+        const u32 rows_per_block = GOB_SIZE_Y << block_height;
+        const u32 gobs_in_x = Common::AlignUpLog2(dst.width * dst_bytes_per_pixel, GOB_SIZE_X_SHIFT) >>
+                              GOB_SIZE_X_SHIFT;
+        const u64 block_size = u64{gobs_in_x} << (GOB_SIZE_SHIFT + block_height);
+        const u32 x_shift = GOB_SIZE_SHIFT + block_height;
+        const u32 first_byte = config.dst_x0 * dst_bytes_per_pixel;
+        const u32 end_byte = (config.dst_x0 + dst_extent_x) * dst_bytes_per_pixel;
+        const u32 first_gob = first_byte >> GOB_SIZE_X_SHIFT;
+        const u32 gob_columns = ((end_byte - 1) >> GOB_SIZE_X_SHIFT) - first_gob + 1;
+        const u32 columns_width = (gob_columns << GOB_SIZE_X_SHIFT) / dst_bytes_per_pixel;
+        const u32 origin_x = config.dst_x0 - (first_gob << GOB_SIZE_X_SHIFT) / dst_bytes_per_pixel;
+        const bool whole_columns = (first_byte & (GOB_SIZE_X - 1)) == 0 &&
+                                   (end_byte & (GOB_SIZE_X - 1)) == 0;
+        const u32 pitch = dst_extent_x * dst_bytes_per_pixel;
+        const u32 first_row = config.dst_y0;
+        const u32 end_row = (std::min)(config.dst_y0 + dst_extent_y, dst.height);
+        // EDEN_NX2_BLIT_VERIFY: also swizzle the whole surface the old way and compare.
+        static const bool verify = std::getenv("EDEN_NX2_BLIT_VERIFY") != nullptr;
+        std::vector<u8> expected;
+        if (verify) {
+            expected.resize(get_surface_size(dst, dst_bytes_per_pixel));
+            memory_manager.ReadBlockUnsafe(dst.Address(), expected.data(), expected.size());
+            SwizzleSubrect(expected, impl->dst_buffer, dst_bytes_per_pixel, dst.width, dst.height,
+                           dst.depth, config.dst_x0, config.dst_y0, dst_extent_x, dst_extent_y,
+                           dst.block_height, dst.block_depth, pitch);
+        }
+        for (u32 block_row = first_row / rows_per_block; block_row * rows_per_block < end_row;
+             ++block_row) {
+            const u32 block_top = block_row * rows_per_block;
+            const u32 rows_begin = (std::max)(first_row, block_top);
+            const u32 rows_end = (std::min)(end_row, block_top + rows_per_block);
+            const GPUVAddr address =
+                dst.Address() + block_row * block_size + (u64{first_gob} << x_shift);
+            const size_t size = size_t{gob_columns} << x_shift;
+            const auto input = std::span<const u8>(impl->dst_buffer)
+                                   .subspan(size_t{rows_begin - first_row} * pitch);
+            const auto swizzle = [&](std::span<u8> output) {
+                const auto swizzle_start = std::chrono::steady_clock::now();
+                SCOPE_EXIT {
+                    swizzling += std::chrono::steady_clock::now() - swizzle_start;
+                };
+                SwizzleSubrect(output, input, dst_bytes_per_pixel, columns_width, rows_per_block, 1,
+                               origin_x, rows_begin - block_top, dst_extent_x,
+                               rows_end - rows_begin, block_height, 0, pitch);
+            };
+            const auto map_start = std::chrono::steady_clock::now();
+            if (whole_columns && rows_end - rows_begin == rows_per_block) {
+                Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::SafeWrite>
+                    memory(memory_manager, address, size, &impl->tmp_buffer);
+                mapping += std::chrono::steady_clock::now() - map_start;
+                swizzle(memory);
+            } else {
+                Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::SafeReadWrite>
+                    memory(memory_manager, address, size, &impl->tmp_buffer);
+                mapping += std::chrono::steady_clock::now() - map_start;
+                ++read_rows;
+                swizzle(memory);
+            }
+        }
+        if (verify) {
+            std::vector<u8> written(expected.size());
+            memory_manager.ReadBlockUnsafe(dst.Address(), written.data(), written.size());
+            size_t mismatches = 0;
+            for (size_t i = 0; i < written.size(); ++i) {
+                mismatches += written[i] != expected[i];
+            }
+            static u32 logged{};
+            if (logged++ < 32) {
+                LOG_WARNING(HW_GPU, "2D blit by block rows check: {} of {} bytes differ ({}x{} at {},{} into {}x{} bh {})",
+                            mismatches, written.size(), dst_extent_x, dst_extent_y, config.dst_x0,
+                            config.dst_y0, dst.width, dst.height, block_height);
+            }
+        }
+        path = "by block rows";
+        converted = std::chrono::steady_clock::now();
+        return true;
     }
 
     const size_t dst_size = get_surface_size(dst, dst_bytes_per_pixel);
@@ -234,6 +433,7 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
                                  dst.pitch, config.dst_x0, config.dst_y0,
                                  static_cast<size_t>(dst_bytes_per_pixel));
     }
+    converted = std::chrono::steady_clock::now();
     return true;
 }
 

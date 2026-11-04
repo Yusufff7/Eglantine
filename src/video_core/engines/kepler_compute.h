@@ -257,6 +257,7 @@ private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
     void FrontApply(FrontState& state, u32 method, u32 argument);
+    void FrontRecordRelease(VideoCommon::GpuSplit& split, const FrontState& state, u32 argument);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
@@ -289,6 +290,10 @@ private:
     void ProcessLaunch();
 
     void ConsumeSinkImpl(Core::System& system) override;
+    /// Whether the front batches what it sends the back (native mode, EDEN_NX2_STATE_BATCH).
+    bool FrontBatching() const;
+    /// Whether the front may send `method` as a state write (a plain store in native mode).
+    bool FrontPlainStore(u32 method) const;
 
     /// Retrieves information about a specific TIC entry from the TIC buffer.
     Texture::TICEntry GetTICEntry(u32 tic_index) const;

@@ -524,10 +524,35 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         maxwell3d->engine_state == Tegra::Engines::Maxwell3D::EngineHint::OnHLEMacro;
 }
 
+void GraphicsEnvironment::Snapshot() {
+    auto copy = std::make_shared<RegisterSnapshot>();
+    const auto& cbufs{maxwell3d->state.shader_stages[stage_index].const_buffers};
+    for (size_t i = 0; i < copy->const_buffers.size() && i < cbufs.size(); ++i) {
+        copy->const_buffers[i] = {cbufs[i].address, cbufs[i].size, cbufs[i].enabled};
+    }
+    const auto& regs{maxwell3d->regs};
+    copy->tex_header_address = regs.tex_header.Address();
+    copy->tex_header_limit = regs.tex_header.limit;
+    copy->via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
+    copy->viewport_transform = regs.viewport_scale_offset_enabled;
+    if (has_hle_engine_state) {
+        copy->replace_table.insert(maxwell3d->replace_table.begin(), maxwell3d->replace_table.end());
+    }
+    snapshot = std::move(copy);
+}
+
 u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
+    u32 value{};
+    if (snapshot) {
+        const auto& cbuf{snapshot->const_buffers[cbuf_index]};
+        if (cbuf.enabled && cbuf_offset < cbuf.size) {
+            value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
+        }
+        cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
+        return value;
+    }
     const auto& cbuf{maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index]};
     ASSERT(cbuf.enabled);
-    u32 value{};
     if (cbuf_offset < cbuf.size) {
         value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
     }
@@ -541,8 +566,9 @@ std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffe
         return std::nullopt;
     }
     const u64 key = (static_cast<u64>(bank) << 32) | static_cast<u64>(offset);
-    auto it = maxwell3d->replace_table.find(key);
-    if (it == maxwell3d->replace_table.end()) {
+    const auto& table = snapshot ? snapshot->replace_table : maxwell3d->replace_table;
+    auto it = table.find(key);
+    if (it == table.end()) {
         return std::nullopt;
     }
     const auto converted_value = [](Tegra::Engines::Maxwell3D::HLEReplacementAttributeType name) {
@@ -563,9 +589,11 @@ std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffe
 
 Shader::TextureType GraphicsEnvironment::ReadTextureType(u32 handle) {
     const auto& regs{maxwell3d->regs};
-    const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
-    auto entry =
-        ReadTextureInfo(regs.tex_header.Address(), regs.tex_header.limit, via_header_index, handle);
+    const bool via_header_index{snapshot ? snapshot->via_header_index
+                                         : regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+    auto entry = ReadTextureInfo(snapshot ? snapshot->tex_header_address : regs.tex_header.Address(),
+                                 snapshot ? snapshot->tex_header_limit : regs.tex_header.limit,
+                                 via_header_index, handle);
     const Shader::TextureType result{ConvertTextureType(entry)};
     texture_types.emplace(handle, result);
     return result;
@@ -573,9 +601,11 @@ Shader::TextureType GraphicsEnvironment::ReadTextureType(u32 handle) {
 
 Shader::TexturePixelFormat GraphicsEnvironment::ReadTexturePixelFormat(u32 handle) {
     const auto& regs{maxwell3d->regs};
-    const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
-    auto entry =
-        ReadTextureInfo(regs.tex_header.Address(), regs.tex_header.limit, via_header_index, handle);
+    const bool via_header_index{snapshot ? snapshot->via_header_index
+                                         : regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+    auto entry = ReadTextureInfo(snapshot ? snapshot->tex_header_address : regs.tex_header.Address(),
+                                 snapshot ? snapshot->tex_header_limit : regs.tex_header.limit,
+                                 via_header_index, handle);
     const Shader::TexturePixelFormat result(ConvertTexturePixelFormat(entry));
     texture_pixel_formats.emplace(handle, result);
     return result;
@@ -587,8 +617,8 @@ bool GraphicsEnvironment::IsTexturePixelFormatInteger(u32 handle) {
 }
 
 u32 GraphicsEnvironment::ReadViewportTransformState() {
-    const auto& regs{maxwell3d->regs};
-    viewport_transform_state = regs.viewport_scale_offset_enabled;
+    viewport_transform_state =
+        snapshot ? snapshot->viewport_transform : maxwell3d->regs.viewport_scale_offset_enabled;
     return viewport_transform_state;
 }
 

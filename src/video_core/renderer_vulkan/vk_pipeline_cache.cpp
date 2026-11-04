@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstddef>
 #include <fstream>
 #include <iostream>
@@ -357,6 +358,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
+      translate_workers(device.HasBrokenParallelShaderCompiling() ? 1ULL
+                                                                  : (std::min)(GetTotalPipelineWorkers(), size_t{4}),
+                        "VkPipelineTranslator", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
     const auto& float_control{device.FloatControlProperties()};
@@ -618,7 +622,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
     }
 
-    const auto shader_dir{Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir)};
+    // EDEN_NX2_SHADER_DIR (testing): keeps the cache somewhere else than the user directory.
+    const char* const shader_dir_override = std::getenv("EDEN_NX2_SHADER_DIR");
+    const auto shader_dir{shader_dir_override != nullptr
+                              ? std::filesystem::path{shader_dir_override}
+                              : Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir)};
     const auto base_dir{shader_dir / fmt::format("{:016x}", title_id)};
     if (!Common::FS::CreateDir(shader_dir) || !Common::FS::CreateDir(base_dir)) {
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
@@ -823,11 +831,34 @@ void ReportNewPipelineKey(const GraphicsPipelineCacheKey& key) {
 }
 } // Anonymous namespace
 
+// EDEN_NX2_ASYNC_TRANSLATE=0: translate new graphics pipelines on the GPU thread, as before.
+static bool AsyncTranslation() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_TRANSLATE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
+    if (has_translated.load(std::memory_order_acquire)) {
+        InstallTranslated();
+    }
     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
     auto& pipeline{pair->second};
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
+        // Translation (tens of ms each, hundreds of new pipelines at once on new content) held
+        // the GPU thread for whole frames. Off it, the draws wait like those still compiling,
+        // except the ones BuiltPipeline never skips (small draws without depth, often one-off
+        // passes into textures).
+        const auto& draw_state = maxwell3d->draw_manager.draw_state;
+        const bool may_skip = maxwell3d->regs.zeta_enable ||
+                              (draw_state.index_buffer.count > 6 && draw_state.vertex_buffer.count > 6);
+        if (use_asynchronous_shaders && AsyncTranslation() && may_skip) {
+            TranslateAsync();
+            return nullptr;
+        }
         pipeline = CreateGraphicsPipeline();
     }
     if (!pipeline) {
@@ -1014,6 +1045,56 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
     }
 }
 } // Anonymous namespace
+
+void PipelineCache::TranslateAsync() {
+    auto job = std::make_unique<TranslateJob>();
+    job->key = graphics_key;
+    GetGraphicsEnvironments(job->environments, graphics_key.unique_hashes);
+    for (Shader::Environment* const env : job->environments.Span()) {
+        static_cast<GraphicsEnvironment*>(env)->Snapshot();
+    }
+    translate_workers.QueueWork([this, job = job.release()]() mutable {
+        std::unique_ptr<TranslateJob> owned{job};
+        thread_local ShaderPools pools;
+        pools.ReleaseContents();
+        owned->pipeline =
+            CreateGraphicsPipeline(pools, owned->key, owned->environments.Span(), nullptr, false);
+        std::scoped_lock lock{translated_mutex};
+        translated.push_back(std::move(owned));
+        has_translated.store(true, std::memory_order_release);
+    });
+}
+
+void PipelineCache::InstallTranslated() {
+    std::vector<std::unique_ptr<TranslateJob>> done;
+    {
+        std::scoped_lock lock{translated_mutex};
+        done.swap(translated);
+        has_translated.store(false, std::memory_order_release);
+    }
+    for (auto& job : done) {
+        auto& entry = graphics_cache[job->key];
+        if (entry || !job->pipeline) {
+            continue;
+        }
+        entry = std::move(job->pipeline);
+        if (pipeline_cache_filename.empty()) {
+            continue;
+        }
+        serialization_thread.QueueWork(
+            [this, key = job->key, envs = std::move(job->environments.envs)] {
+                boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
+                    env_ptrs;
+                for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+                    if (key.unique_hashes[index] != 0) {
+                        env_ptrs.push_back(&envs[index]);
+                    }
+                }
+                SerializePipeline(key, env_ptrs, pipeline_cache_filename, CACHE_VERSION);
+            });
+        QueueVulkanPipelineCacheFlush();
+    }
+}
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();

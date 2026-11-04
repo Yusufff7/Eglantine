@@ -39,6 +39,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
+#include "video_core/background_destroyer.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -238,13 +239,56 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 RasterizerVulkan::~RasterizerVulkan() {
     scheduler.WaitWorker();
     scheduler.Finish();
+    VideoCommon::BackgroundDestroyer::Instance().Wait();
 }
 
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
-
+    // A draw holding the GPU thread for 30 ms or more is a stutter: log its steps.
+    // The TSC clock: these run ~120k times a second (QueryPerformanceCounter was 10% of the thread).
+    namespace Profile = VideoCommon::Nx2Profile;
+    std::array<u64, 6> marks{};
+    marks[0] = Profile::Now();
+    // With EDEN_NX2_GPU_PROFILE, slow draws also say which zones took the time.
+    std::array<u64, static_cast<size_t>(Profile::Zone::Count)> zones_before{};
+    if (Profile::Enabled()) {
+        zones_before = Profile::t_data.exclusive_ns;
+    }
     SCOPE_EXIT {
+        const u64 tick_start = Profile::Now();
         gpu.TickWork();
+        const u64 end = Profile::Now();
+        if (end - marks[0] > 30'000'000) [[unlikely]] {
+            static u32 logged{};
+            if (logged++ < 64) {
+                for (auto& mark : marks) {
+                    if (mark == 0) {
+                        mark = tick_start;
+                    }
+                }
+                const auto ms = [](u64 ns) { return static_cast<double>(ns) / 1e6; };
+                std::string zones;
+                if (Profile::Enabled()) {
+                    std::vector<std::pair<u64, size_t>> spent;
+                    for (size_t i = 0; i < zones_before.size(); ++i) {
+                        const u64 delta = Profile::t_data.exclusive_ns[i] - zones_before[i];
+                        if (delta >= 1'000'000) {
+                            spent.emplace_back(delta, i);
+                        }
+                    }
+                    std::sort(spent.rbegin(), spent.rend());
+                    for (const auto& [ns, zone] : spent) {
+                        zones += fmt::format(" {} {:.1f}", Profile::zone_names[zone], ns / 1e6);
+                    }
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Slow draw: {:.1f} ms (flush {:.1f}, pipeline {:.1f}, configure {:.1f}, "
+                            "dynamic state {:.1f}, record {:.1f}, tick work {:.1f}){}",
+                            ms(end - marks[0]), ms(marks[1] - marks[0]), ms(marks[2] - marks[1]),
+                            ms(marks[3] - marks[2]), ms(marks[4] - marks[3]), ms(marks[5] - marks[4]),
+                            ms(end - tick_start), zones);
+            }
+        }
     };
     bool submitted = false;
     SCOPE_EXIT {
@@ -254,12 +298,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             LOG_DEBUG(HW_GPU, "Native graphics draw failed; refusing submission completion");
         }
     };
-    namespace Profile = VideoCommon::Nx2Profile;
     {
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
         gpu_memory->FlushCaching();
     }
+    marks[1] = Profile::Now();
 
     const auto report_failure = [&](std::string_view reason) {
         static std::set<std::tuple<u64, u64, std::string_view>> seen;
@@ -279,6 +323,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         report_failure("no pipeline");
         return;
     }
+    marks[2] = Profile::Now();
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
@@ -286,11 +331,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         report_failure("configure failed");
         return;
     }
+    marks[3] = Profile::Now();
 
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
         UpdateDynamicStates();
     }
+    marks[4] = Profile::Now();
 
     query_cache.NotifySegment(true);
     HandleTransformFeedback();
@@ -299,6 +346,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         Profile::Scope scope{Profile::Zone::DrawRecord};
         draw_func();
     }
+    marks[5] = Profile::Now();
     submitted = true;
     static u32 native_capture_count{};
     if (maxwell3d->GetNativeMacroEngine().native_turing &&
@@ -1035,10 +1083,38 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 }
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    // Ranges the texture and shader caches held nothing in when last looked at, and still
+    // can't (nothing registered since), are left out of them; the buffer and query caches
+    // always see the write. EDEN_NX2_INVALIDATION_MEMO=0 looks every time.
+    static const bool memo = [] {
+        const char* value = std::getenv("EDEN_NX2_INVALIDATION_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    const u64 shader_generation = pipeline_cache.RegistrationGeneration();
+    const auto slot = [this](DAddr addr, std::size_t size) -> EmptyRange& {
+        return empty_ranges[((addr >> 6) ^ (addr >> 14) ^ size) & (empty_ranges.size() - 1)];
+    };
+    std::array<bool, 64> known_empty{};
+    const bool small = sequences.size() <= known_empty.size();
     {
         std::scoped_lock lock{texture_cache.mutex};
-        for (const auto& [addr, size] : sequences) {
-            texture_cache.WriteMemory(addr, size);
+        const u64 texture_generation = texture_cache.RegistrationGeneration();
+        for (size_t i = 0; i < sequences.size(); ++i) {
+            const auto& [addr, size] = sequences[i];
+            if (memo && small) {
+                const EmptyRange& known = slot(addr, size);
+                if (known.addr == addr && known.size == size &&
+                    known.texture_generation == texture_generation &&
+                    known.shader_generation == shader_generation) {
+                    known_empty[i] = true;
+                    continue;
+                }
+            }
+            const bool image = texture_cache.WriteMemoryFound(addr, size);
+            if (memo && small && !image) {
+                // Shader side checked below: remembered only if it is empty too.
+                slot(addr, size) = {addr, size, texture_generation, ~u64{}};
+            }
         }
     }
     {
@@ -1047,10 +1123,22 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
             buffer_cache.WriteMemory(addr, size);
         }
     }
-    {
-        for (const auto& [addr, size] : sequences) {
-            query_cache.InvalidateRegion(addr, size);
-            pipeline_cache.InvalidateRegion(addr, size);
+    for (size_t i = 0; i < sequences.size(); ++i) {
+        const auto& [addr, size] = sequences[i];
+        query_cache.InvalidateRegion(addr, size);
+        if (small && known_empty[i]) {
+            continue;
+        }
+        const bool shader = pipeline_cache.InvalidateRegionFound(addr, size);
+        if (memo && small) {
+            EmptyRange& known = slot(addr, size);
+            if (known.addr == addr && known.size == size && known.shader_generation == ~u64{}) {
+                if (shader) {
+                    known = {};
+                } else {
+                    known.shader_generation = shader_generation;
+                }
+            }
         }
     }
 }
@@ -1192,19 +1280,37 @@ void RasterizerVulkan::FlushCommands() {
 }
 
 void RasterizerVulkan::TickFrame() {
+    // A frame end holding the GPU thread for a frame or more is a stutter: log its steps.
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
     draw_counter = 0;
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();
     descriptor_buffer_ring.TickFrame();
+    const auto t1 = Clock::now();
     fence_manager.TickFrame();
+    const auto t2 = Clock::now();
     staging_pool.TickFrame();
+    const auto t3 = Clock::now();
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.TickFrame();
     }
+    const auto t4 = Clock::now();
     {
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.TickFrame();
+    }
+    const auto t5 = Clock::now();
+    if (t5 - t0 > std::chrono::milliseconds{15}) {
+        static u32 logged{};
+        if (logged++ < 64) {
+            const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+            LOG_WARNING(Render_Vulkan,
+                        "Slow frame end: {:.1f} ms (descriptors {:.1f}, fences {:.1f}, staging "
+                        "{:.1f}, texture cache {:.1f}, buffer cache {:.1f})",
+                        ms(t5 - t0), ms(t1 - t0), ms(t2 - t1), ms(t3 - t2), ms(t4 - t3), ms(t5 - t4));
+        }
     }
 }
 

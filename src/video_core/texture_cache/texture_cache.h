@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -200,6 +201,8 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
+    using TickClock = std::chrono::steady_clock;
+    const auto tick_start = TickClock::now();
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -228,7 +231,11 @@ void TextureCache<P>::TickFrame() {
         // unused. EDEN_NX2_TC_*_MIB overrides still win.
         if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
             if (native_thresholds_applied && budget_check_frames++ % 60 == 0) {
-                const u64 budget = runtime.GetDeviceMemoryBudget();
+                BackgroundDestroyer::Instance().Run([this] {
+                    queried_budget.store(runtime.GetDeviceMemoryBudget(), std::memory_order_release);
+                });
+            }
+            if (const u64 budget = queried_budget.exchange(0, std::memory_order_acq_rel); budget != 0) {
                 if (budget > 2_GiB) {
                     const u64 old_critical = critical_memory;
                     critical_memory = budget - 768_MiB;
@@ -243,9 +250,22 @@ void TextureCache<P>::TickFrame() {
         }
     }
     // If we can obtain the memory info, use it instead of the estimate.
+    // The driver query took up to 13 ms (NVIDIA asks the OS): run it on the destroyer thread and
+    // take its answer a frame or so later, the estimates kept in between.
     if (runtime.CanReportMemoryUsage()) {
-        total_used_memory = runtime.GetDeviceMemoryUsage();
+        if (memory_query_done.exchange(false, std::memory_order_acquire)) {
+            total_used_memory = queried_memory.load(std::memory_order_relaxed);
+        }
+        if (memory_query_frames++ % 8 == 0 &&
+            !memory_query_pending.exchange(true, std::memory_order_acq_rel)) {
+            BackgroundDestroyer::Instance().Run([this] {
+                queried_memory.store(runtime.GetDeviceMemoryUsage(), std::memory_order_relaxed);
+                memory_query_done.store(true, std::memory_order_release);
+                memory_query_pending.store(false, std::memory_order_release);
+            });
+        }
     }
+    const auto tick_memory = TickClock::now();
     // Every 600 frames: device memory in use against the collector's thresholds, and what the
     // images themselves account for (VRAM pressure makes the collector thrash).
     if (static u64 frames{}; ++frames % 600 == 0) {
@@ -307,14 +327,18 @@ void TextureCache<P>::TickFrame() {
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
+    const auto tick_stats = TickClock::now();
     if (total_used_memory > minimum_memory) {
         RunGarbageCollector();
     }
-    sentenced_images.Tick();
-    sentenced_framebuffers.Tick();
-    sentenced_image_view.Tick();
+    const auto tick_gc = TickClock::now();
+    sentenced_images.Tick(true);
+    sentenced_framebuffers.Tick(true);
+    sentenced_image_view.Tick(true);
+    const auto tick_sentenced = TickClock::now();
     TickAsyncDecode();
     TickAsyncUnswizzle();
+    const auto tick_async = TickClock::now();
 
     runtime.TickFrame();
     ++frame_tick;
@@ -324,6 +348,20 @@ void TextureCache<P>::TickFrame() {
             runtime.FreeDeferredStagingBuffer(buffer);
         }
         async_buffers_death_ring.clear();
+    }
+    const auto tick_end = TickClock::now();
+    if (tick_end - tick_start > std::chrono::milliseconds{10}) {
+        static u32 logged{};
+        if (logged++ < 64) {
+            const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+            LOG_WARNING(HW_GPU,
+                        "Slow texture cache tick: {:.1f} ms (memory query {:.1f}, stats {:.1f}, "
+                        "collector {:.1f}, destruction {:.1f}, async {:.1f}, runtime {:.1f})",
+                        ms(tick_end - tick_start), ms(tick_memory - tick_start),
+                        ms(tick_stats - tick_memory), ms(tick_gc - tick_stats),
+                        ms(tick_sentenced - tick_gc), ms(tick_async - tick_sentenced),
+                        ms(tick_end - tick_async));
+        }
     }
 }
 
@@ -718,7 +756,14 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 
 template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
-    ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
+    WriteMemoryFound(cpu_addr, size);
+}
+
+template <class P>
+bool TextureCache<P>::WriteMemoryFound(DAddr cpu_addr, size_t size) {
+    bool found = false;
+    ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size, &found](ImageId image_id, Image& image) {
+        found = true;
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
@@ -736,6 +781,7 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
             UntrackImage(image, image_id);
         }
     });
+    return found;
 }
 
 template <class P>
@@ -2062,9 +2108,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         if (IsPixelFormatASTC(new_info.format) && runtime.UseOpaqueAstcFormat()) {
             const size_t scan_bytes = CalculateGuestSizeInBytes(new_info);
             if (scan_bytes <= MaxScanBytes) {
-                astc_scan_buffer.resize(scan_bytes);
-                gpu_memory->ReadBlockUnsafe(gpu_addr, astc_scan_buffer.data(), scan_bytes);
-                new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
+                // In place where the guest memory is contiguous (copied otherwise).
+                Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>
+                    scan_data(*gpu_memory, gpu_addr, scan_bytes, &astc_scan_buffer);
+                new_info.astc_opaque = AstcDataLooksOpaque(scan_data);
                 ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
             }
         }
@@ -2613,6 +2660,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    ++registration_generation;
     u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
     if ((IsPixelFormatASTC(image.info.format) &&
          True(image.flags & ImageFlagBits::AcceleratedUpload)) ||

@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 #include <vector>
 
@@ -15,6 +16,8 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "common/logging.h"
+#include "video_core/background_destroyer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -98,7 +101,9 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
 }
 
-StagingBufferPool::~StagingBufferPool() = default;
+StagingBufferPool::~StagingBufferPool() {
+    VideoCommon::BackgroundDestroyer::Instance().Wait();
+}
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
@@ -122,9 +127,19 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 void StagingBufferPool::TickFrame() {
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
 
+    const auto start = std::chrono::steady_clock::now();
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
+    if (const auto took = std::chrono::steady_clock::now() - start;
+        took > std::chrono::milliseconds{10}) {
+        static u32 logged{};
+        if (logged++ < 64) {
+            LOG_WARNING(Render_Vulkan, "Slow staging release: {:.1f} ms at level {} (1 << {} bytes)",
+                        std::chrono::duration<double, std::milli>(took).count(),
+                        current_delete_level, current_delete_level);
+        }
+    }
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
@@ -276,7 +291,13 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);
     const auto begin = entries.begin() + begin_offset;
     const auto end = entries.begin() + end_offset;
-    entries.erase(std::remove_if(begin, end, is_deletable), end);
+    const auto kept_end = std::stable_partition(
+        begin, end, [&](const StagingBuffer& entry) { return !is_deletable(entry); });
+    if (kept_end != end) {
+        VideoCommon::BackgroundDestroyer::Instance().Destroy(std::vector<StagingBuffer>(
+            std::make_move_iterator(kept_end), std::make_move_iterator(end)));
+        entries.erase(kept_end, end);
+    }
 
     const size_t new_size = entries.size();
     staging.delete_index += deletions_per_tick;

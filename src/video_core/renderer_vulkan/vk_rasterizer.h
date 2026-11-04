@@ -230,6 +230,16 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+
+    /// Ranges InnerInvalidation found no image or shader in, with the caches' registration
+    /// generations then (constant buffer data rewritten before every draw comes back to them).
+    struct EmptyRange {
+        DAddr addr;
+        size_t size;
+        u64 texture_generation;
+        u64 shader_generation;
+    };
+    std::array<EmptyRange, 256> empty_ranges{};
 };
 
 } // namespace Vulkan

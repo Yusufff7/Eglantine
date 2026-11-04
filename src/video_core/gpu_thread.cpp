@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <chrono>
 #include <thread>
 
@@ -16,9 +17,11 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/gpu.h"
+#include "common/nx2_trace.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sampler.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
 
@@ -51,7 +54,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         Common::SetCurrentThreadName("GPU");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::SetCurrentThreadToPerformanceCores();
+        Common::PinCurrentThreadToDedicatedCore(1);
         system.RegisterHostThread();
+        VideoCommon::Nx2Sampler::StartForCurrentThread("front");
 
         auto current_context = context.Acquire();
         CommandDataContainer next;
@@ -69,20 +74,28 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     scheduler.ResumePending(system.GPU());
                 }
                 if (!state.queue.TryPop(next)) {
-                    // The CPU usually releases the semaphore soon after: poll for half a
-                    // millisecond before sleeping, or every wait also waits out a host sleep
-                    // (title 1 waits ~25 times a second).
+                    // The CPU usually releases the semaphore soon after: poll for a while
+                    // (EDEN_NX2_PENDING_SPIN_US, 2 ms by default) before waiting, or every wait
+                    // also waits out a host sleep (title 1 waits ~25 times a second). Then wait
+                    // on the queue, not a plain sleep: commands the CPU sends meanwhile (often
+                    // for the other channels) run as they come instead of after the sleep.
+                    static const auto pending_spin = std::chrono::microseconds{[] {
+                        const char* text = std::getenv("EDEN_NX2_PENDING_SPIN_US");
+                        return text ? std::strtoll(text, nullptr, 10) : 2000LL;
+                    }()};
                     Profile::Scope scope{Profile::Zone::PendingSleep};
-                    if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                    Common::Nx2Trace::Scope trace{"gpu", "pending semaphore wait"};
+                    if (std::chrono::steady_clock::now() - last_progress < pending_spin) {
                         std::this_thread::yield();
-                    } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                        continue;
                     }
-                    continue;
+                    if (!state.queue.PopWaitFor(next, std::chrono::milliseconds{1})) {
+                        continue;
+                    }
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
+                Common::Nx2Trace::Scope trace{"gpu", "waiting for commands"};
                 state.queue.PopWait(next, stop_token);
             }
             if (stop_token.stop_requested()) {
@@ -95,9 +108,22 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                     Profile::Scope scope{Profile::Zone::Push};
+                    Common::Nx2Trace::Scope trace{"gpu", "command list"};
+                    const auto list_start = std::chrono::steady_clock::now();
+                    const size_t list_entries = submit_list->entries.command_lists.size();
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+                    if (const auto took = std::chrono::steady_clock::now() - list_start;
+                        took > std::chrono::milliseconds{30}) [[unlikely]] {
+                        static u32 reported{};
+                        if (reported++ < 200) {
+                            LOG_WARNING(HW_GPU, "GPU front stall: {} ms in a command list ({} entries, channel {}) at present {}",
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(took).count(),
+                                        list_entries, submit_list->channel,
+                                        Common::Nx2Trace::g_present_count.load(std::memory_order_relaxed));
+                        }
+                    }
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
-                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
+                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); }, false);
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     split.DeferFunction(std::move(run->func));
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
@@ -105,15 +131,16 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         rasterizer_ptr->FlushRegion(addr, size);
                     });
                 } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
+                    // The CPU's words are in memory already; the back's caches let go of them.
                     split.Defer([rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
                         rasterizer_ptr->OnCacheInvalidation(addr, size);
-                    });
+                    }, false);
                 } else {
                     ASSERT(false);
                 }
                 split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
                     SignalCommand(*state_ptr, fence, block);
-                });
+                }, false);
                 split.Publish();
                 continue;
             }

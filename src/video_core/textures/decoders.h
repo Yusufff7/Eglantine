@@ -50,6 +50,12 @@ void UnswizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes
                       u32 width, u32 height, u32 depth, u32 origin_x, u32 origin_y, u32 extent_x,
                       u32 extent_y, u32 block_height, u32 block_depth, u32 pitch_linear, bool native_tiling = false);
 
+/// Copies a subrectangle between two 2D tiled surfaces of the same shape, at the same place in
+/// both: whole GOBs at once, pixel by pixel only at the edges. bytes_per_pixel: a power of two.
+void CopySwizzledSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
+                         u32 width, u32 height, u32 origin_x, u32 origin_y, u32 extent_x,
+                         u32 extent_y, u32 block_height, bool native_tiling = false);
+
 /// Obtains the offset of the gob for positions 'dst_x' & 'dst_y'
 u64 GetGOBOffset(u32 width, u32 height, u32 dst_x, u32 dst_y, u32 block_height,
                  u32 bytes_per_pixel);

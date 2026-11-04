@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -168,6 +169,20 @@ private:
 
     ShaderPools main_pools;
 
+    /// Graphics pipelines translated and built on the workers (TranslateAsync), installed by
+    /// the GPU thread at its next lookup (InstallTranslated). Their keys map to null until then:
+    /// draws needing them are skipped, as for pipelines still compiling.
+    struct TranslateJob {
+        GraphicsPipelineCacheKey key;
+        GraphicsEnvironments environments;
+        std::unique_ptr<GraphicsPipeline> pipeline;
+    };
+    void TranslateAsync();
+    void InstallTranslated();
+    std::mutex translated_mutex;
+    std::vector<std::unique_ptr<TranslateJob>> translated;
+    std::atomic<bool> has_translated{};
+
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
 
@@ -181,6 +196,9 @@ private:
     std::atomic_bool flush_in_flight{};
 
     Common::ThreadWorker workers;
+    /// TranslateAsync's jobs, apart from `workers`: a burst of them (hundreds on new content)
+    /// neither waits ahead of the pipelines a draw waits for nor takes every core.
+    Common::ThreadWorker translate_workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
 };

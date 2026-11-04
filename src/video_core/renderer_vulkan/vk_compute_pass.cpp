@@ -27,6 +27,7 @@
 #include "video_core/host_shaders/vulkan_quad_indexed_comp_spv.h"
 #include "video_core/host_shaders/vulkan_uint8_comp_spv.h"
 #include "video_core/host_shaders/block_linear_unswizzle_3d_bcn_comp_spv.h"
+#include "common/nx2_trace.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/surface.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -756,6 +757,7 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     if (flush_only) {
         scheduler.Flush();
     } else {
+        Common::Nx2Trace::Scope trace{"gpu wait", "host GPU wait: compute pass"};
         scheduler.Finish();
     }
     const auto end = std::chrono::steady_clock::now();

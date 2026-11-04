@@ -66,12 +66,40 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
 
 KeplerCompute::~KeplerCompute() = default;
 
+bool KeplerCompute::FrontBatching() const {
+    // EDEN_NX2_STATE_BATCH=0 turns this off with the 3D engine's batches.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_STATE_BATCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && native_mode;
+}
+
+bool KeplerCompute::FrontPlainStore(u32 method) const {
+    return FrontBatching() && method < native_plain_methods.size() && native_plain_methods[method];
+}
+
 void KeplerCompute::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     rasterizer = rasterizer_;
     upload_state.BindRasterizer(rasterizer);
 }
 
 void KeplerCompute::ConsumeSinkImpl(Core::System& system) {
+    if (native_mode) {
+        // Plain stores only (FrontCallMethod sends nothing else here): as CallMethod does.
+        for (auto [method, value] : method_sink) {
+            if (method < native_plain_methods.size() && native_plain_methods[method]) {
+                native_registers[method] = value;
+                if (method < Regs::NUM_REGS) {
+                    regs.reg_array[method] = value;
+                }
+            } else {
+                CallMethod(system, method, value, true);
+            }
+        }
+        method_sink.clear();
+        return;
+    }
     for (auto [method, value] : method_sink) {
         if (method < Regs::NUM_REGS) {
             regs.reg_array[method] = value;
@@ -366,7 +394,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         const u32 value = memory_manager.Read<u32>(address) + payload;
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value, 1);
                         }
                         static const u64 watch = [] {
                             const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
@@ -386,7 +414,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value, 2);
                         }
                     });
                 } else {
@@ -439,6 +467,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
 }
 
 void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
+    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::ComputeMethod};
     if (native_mode) {
         // Most of the compute class's register writes (QMD fields replayed by its macros for
         // each of thousands of dispatches a second) only store the value: ~4% of title 1's GPU
@@ -773,7 +802,7 @@ struct KeplerCompute::FrontState {
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
     if (!front) [[unlikely]] {
         // Copy the back's state and take the macros over while it is idle.
-        split.Drain();
+        split.Drain(VideoCommon::GpuSplit::DrainReason::FrontInit);
         front = std::make_unique<FrontState>();
         front->registers = native_registers;
         front->executing_macro = native_executing_macro;
@@ -856,7 +885,30 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
         return;
     }
     FrontApply(fs, method, argument);
+    if (method >= 0x45 && method <= 0x48 && FrontBatching()) {
+        return; // Macro code and bindings: the front's (ProcessNativeMethod ignores them)
+    }
+    if (FrontPlainStore(method) && segment == nullptr) {
+        split.State(this, method, argument);
+        return;
+    }
     split.Method(this, method, argument, is_last_call, segment);
+    if (method == 0x6c3) {
+        FrontRecordRelease(split, fs, argument);
+    }
+}
+
+void KeplerCompute::FrontRecordRelease(VideoCommon::GpuSplit& split, const FrontState& fs,
+                                       u32 argument) {
+    // SET_REPORT_SEMAPHORE_D (see ProcessNativeReportSemaphore): a plain release, no reduction.
+    if ((argument & 3) != 0 || ((argument >> 3) & 1) != 0) {
+        return;
+    }
+    const GPUVAddr address =
+        (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+        split.RecordRelease(*device, fs.registers[0x6c2]);
+    }
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -902,7 +954,14 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                 return false;
             }
             FrontApply(fs, address, value);
+            if (FrontPlainStore(address)) {
+                split.State(this, address, value);
+                return true;
+            }
             split.MacroWrite(this, address, value);
+            if (address == 0x6c3) {
+                FrontRecordRelease(split, fs, value);
+            }
             return true;
         });
     if (!result.success) {

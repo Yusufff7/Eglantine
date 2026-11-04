@@ -43,6 +43,12 @@ void KLightLock::Lock() {
     }
 }
 
+bool KLightLock::TryLock() {
+    uintptr_t expected = 0;
+    return m_tag.compare_exchange_strong(expected, uintptr_t(GetCurrentThreadPointer(m_kernel)),
+                                         std::memory_order_acquire);
+}
+
 void KLightLock::Unlock() {
     const uintptr_t cur_thread = reinterpret_cast<uintptr_t>(GetCurrentThreadPointer(m_kernel));
 

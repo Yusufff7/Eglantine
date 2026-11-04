@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/core.h"
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_file.h"
@@ -33,6 +34,8 @@ Result IFile::Read(
     LOG_DEBUG(Service_FS, "called, option={}, offset={:#x}, length={}", option.value, offset,
               size);
 
+    Core::g_nx2_last_read_present.store(Core::g_nx2_present_count.load(std::memory_order_relaxed),
+                                        std::memory_order_relaxed);
     // Read the data from the Storage backend
     R_RETURN(
         backend->Read(reinterpret_cast<size_t*>(out_size.Get()), offset, out_buffer.data(), size));
